@@ -1,3 +1,6 @@
 /target
 node_modules/
 dist/
+apps/wisp/node_modules/
+apps/wisp/dist/
+apps/wisp/src-tauri/gen/

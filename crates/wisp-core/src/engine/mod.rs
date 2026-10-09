@@ -4,7 +4,7 @@ mod session;
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -18,12 +18,12 @@ use crate::discovery::{DiscoveredSet, Discovery};
 use crate::fsutil::create_private_dir;
 use crate::history::{History, HistoryEntry, HistoryQuery};
 use crate::identity::{Identity, Os};
-use crate::item::{ClipItem, ItemKind, Preview};
+use crate::item::{ClipItem, ClipPayload, ItemKind, Preview};
 use crate::pairing::PairingSession;
 use crate::peers::{DeliveryMode, Peer, PeerStore};
 use crate::policy::{offer_for, Inbox, InboxEntry, OfferQueue};
 use crate::protocol::Message;
-use crate::transfer::{cleanup_partials, expand_paths, RESUME_WINDOW};
+use crate::transfer::{cleanup_partials, expand_paths, reserve_path, RESUME_WINDOW};
 use crate::transport::Transport;
 use crate::{CoreError, Result};
 
@@ -130,6 +130,8 @@ struct Inner {
     discovered: Mutex<DiscoveredSet>,
     /// Peers with a dial in flight, so ticks and manual adds do not stack dials.
     dialing: Mutex<HashSet<Uuid>>,
+    /// Peers with a queue delivery running, so only one task replays a peer's queue.
+    delivering: Mutex<HashSet<Uuid>>,
     closed: AtomicBool,
     /// Flips to true on shutdown and wakes every background loop that waits on it.
     shutdown: watch::Sender<bool>,
@@ -149,7 +151,9 @@ impl Node {
         // tmp only holds clipboard spills of a previous run, which may carry secrets.
         let tmp_dir = cfg.data_dir.join("tmp");
         match std::fs::remove_dir_all(&tmp_dir) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                tracing::warn!("could not clear the spill folder: {e}");
+            }
             _ => {}
         }
         create_private_dir(&tmp_dir)?;
@@ -177,6 +181,7 @@ impl Node {
             tmp_dir,
             discovered: Mutex::new(DiscoveredSet::new()),
             dialing: Mutex::new(HashSet::new()),
+            delivering: Mutex::new(HashSet::new()),
             closed: AtomicBool::new(false),
             shutdown,
         });
@@ -304,6 +309,22 @@ impl Node {
         write_and_mark(self.inner.clipboard.as_ref(), &self.inner.echo, &item.payload).await
     }
 
+    /// Writes a timeline item to `dir` as a file and returns the path it got.
+    pub async fn export_item(&self, id: Uuid, dir: &Path) -> Result<PathBuf> {
+        let item = self.inner.history.lock().unwrap().load(id)?;
+        let item = item.ok_or_else(|| CoreError::Transfer("item is no longer in the timeline".into()))?;
+        let (ext, bytes) = match item.payload {
+            ClipPayload::Text(t) => ("txt", t.into_bytes()),
+            ClipPayload::Html { html, .. } => ("html", html.into_bytes()),
+            ClipPayload::Image { png, .. } => ("png", png),
+        };
+        tokio::fs::create_dir_all(dir).await?;
+        let wanted = dir.join(format!("wisp-{}.{ext}", item.created_ms));
+        let path = reserve_path(&wanted).await?;
+        tokio::fs::write(&path, bytes).await?;
+        Ok(path)
+    }
+
     pub async fn send_clipboard_to(&self, peer: Uuid) -> Result<()> {
         let payload = self
             .inner
@@ -357,6 +378,17 @@ impl Node {
         }
         self.inner.transport.close();
     }
+
+    /// Shuts down, then waits until every background task released the node (and with it the
+    /// bound socket), or until `budget` elapses. Other clones of this handle delay the release.
+    pub async fn shutdown_and_wait(&self, budget: Duration) {
+        self.shutdown();
+        let deadline = tokio::time::Instant::now() + budget;
+        let _ = tokio::time::timeout(budget, self.inner.transport.wait_idle()).await;
+        while Arc::strong_count(&self.inner) > 1 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -366,7 +398,7 @@ mod tests {
     use super::*;
     use crate::clipboard::MemoryClipboard;
     use crate::identity::Fingerprint;
-    use crate::item::{ClipPayload, MAX_CLIP_BYTES};
+    use crate::item::MAX_CLIP_BYTES;
 
     async fn start_node(dir: &std::path::Path) -> (Node, Arc<MemoryClipboard>, mpsc::UnboundedReceiver<Event>) {
         let clip = Arc::new(MemoryClipboard::new());
@@ -427,6 +459,26 @@ mod tests {
             addresses: vec![],
             mode: DeliveryMode::Catch,
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_and_wait_returns_quickly_and_frees_the_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, _clip, _rx) = start_node(dir.path()).await;
+        let port = node.local_addr().unwrap().port();
+        let began = Instant::now();
+        node.shutdown_and_wait(Duration::from_secs(3)).await;
+        assert!(began.elapsed() < Duration::from_secs(2));
+        drop(node);
+        let mut freed = false;
+        for _ in 0..50 {
+            if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(freed, "port {port} should be free again");
     }
 
     #[tokio::test]
@@ -499,6 +551,38 @@ mod tests {
         node.inner.clone().deliver_queued(peer, current).await;
         assert_eq!(queued_ids(&node, peer), ids);
         node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn queued_offers_for_connected_peers_are_delivered() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let (a, _ca, mut a_events) = start_node(dir_a.path()).await;
+        let (b, _cb, mut b_events) = start_node(dir_b.path()).await;
+        let code = b.begin_pairing();
+        a.pair_with(b.local_addr().unwrap(), &code).await.unwrap();
+        wait_for(&mut a_events, |e| matches!(e, Event::PeerOnline { .. })).await;
+        wait_for(&mut b_events, |e| matches!(e, Event::PeerOnline { .. })).await;
+        // Let the delivery started by the connection finish with an empty queue.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // Queued while connected, for example after a send that timed out.
+        let item = ClipItem::new(a.device_id(), ClipPayload::Text("late".into()));
+        a.inner.queue.lock().unwrap().push(b.device_id(), &item);
+        let received = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match b_events.recv().await.expect("event stream ended") {
+                    Event::OfferReceived(info) => return info,
+                    Event::PeerOffline { .. } | Event::PeerOnline { .. } => panic!("the peers reconnected"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the queued offer was not delivered");
+        assert_eq!(received.item_id, item.id);
+        a.shutdown();
+        b.shutdown();
     }
 
     #[tokio::test]

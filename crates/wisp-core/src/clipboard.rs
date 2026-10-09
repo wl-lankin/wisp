@@ -249,7 +249,11 @@ pub fn spawn_monitor(
             if now == seen {
                 continue;
             }
-            let payload = match backend.read() {
+            let reader = backend.clone();
+            let read = tokio::task::spawn_blocking(move || reader.read())
+                .await
+                .unwrap_or_else(|e| Err(CoreError::Clipboard(e.to_string())));
+            let payload = match read {
                 Ok(Some(p)) => p,
                 Ok(None) => {
                     seen = now;

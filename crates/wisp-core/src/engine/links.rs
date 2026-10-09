@@ -39,6 +39,25 @@ impl Inner {
                 for peer in offline {
                     self.clone().dial(peer);
                 }
+                // Offers queued while connected (a send that timed out, for example) would
+                // otherwise wait for the next reconnect.
+                let waiting: Vec<Uuid> = {
+                    // Lock order everywhere: peers, then conns; the queue is a leaf lock.
+                    let peers = self.peers.lock().unwrap();
+                    let conns = self.conns.lock().unwrap();
+                    let queue = self.queue.lock().unwrap();
+                    peers
+                        .all()
+                        .iter()
+                        .map(|p| p.device_id)
+                        .filter(|id| conns.contains_key(id) && !queue.is_empty_for(*id))
+                        .collect()
+                };
+                for peer in waiting {
+                    if let Some(conn) = self.connection(peer) {
+                        self.spawn_delivery(peer, conn);
+                    }
+                }
             }
         });
     }

@@ -268,7 +268,19 @@ impl Inner {
                 version: PROTOCOL_VERSION,
             };
             let _ = send_on(&conn, &hello).await;
-            this.deliver_queued(peer, conn).await;
+            this.spawn_delivery(peer, conn);
+        });
+    }
+
+    /// Starts replaying `peer`'s queue unless a delivery for that peer is already running.
+    pub(super) fn spawn_delivery(self: &Arc<Self>, peer: Uuid, conn: quinn::Connection) {
+        if !self.delivering.lock().unwrap().insert(peer) {
+            return;
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            this.clone().deliver_queued(peer, conn).await;
+            this.delivering.lock().unwrap().remove(&peer);
         });
     }
 
@@ -350,7 +362,10 @@ impl Inner {
     }
 
     async fn handle_uni(self: &Arc<Self>, peer: Uuid, mut recv: quinn::RecvStream) -> Result<()> {
-        match read_frame(&mut recv).await? {
+        let msg = read_frame(&mut recv).await?;
+        // Consume the FIN so the sender sees a clean finish instead of STOP_SENDING.
+        let _ = recv.read_to_end(0).await;
+        match msg {
             Message::Hello { name, .. } => {
                 let name = cap_device_name(&name);
                 let mut peers = self.peers.lock().unwrap();

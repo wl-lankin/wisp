@@ -115,6 +115,11 @@ impl Transport {
         self.endpoint.close(0u32.into(), b"bye");
     }
 
+    /// Resolves once every connection of the endpoint has finished closing.
+    pub async fn wait_idle(&self) {
+        self.endpoint.wait_idle().await;
+    }
+
     fn client_config(&self, expected: Option<Fingerprint>) -> Result<quinn::ClientConfig> {
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(self.key_der.clone()));
         let mut client_tls = rustls::ClientConfig::builder_with_provider(self.provider.clone())
