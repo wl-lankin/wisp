@@ -23,8 +23,34 @@ const MAX_STREAM_KIND_FRAME: usize = 16;
 /// How long an unknown device has to open its pairing stream before it is dropped.
 const STREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Lets simultaneous dials settle on one connection before queued offers are replayed.
+const QUEUE_SETTLE: Duration = Duration::from_millis(500);
+/// Bounds one offer delivery to one peer.
+const SEND_TIMEOUT: Duration = Duration::from_secs(2);
+
 fn net_err(e: impl std::fmt::Display) -> CoreError {
     CoreError::Transport(e.to_string())
+}
+
+/// Opens a uni stream on this exact connection and sends one message.
+async fn send_on(conn: &quinn::Connection, msg: &Message) -> Result<()> {
+    let mut stream = conn.open_uni().await.map_err(net_err)?;
+    write_frame(&mut stream, msg).await?;
+    stream.finish().map_err(net_err)?;
+    Ok(())
+}
+
+/// Like `send_on`, but only succeeds once the peer acknowledged every byte, so an offer on a
+/// connection that dies right after the write is not mistaken for a delivered one.
+async fn send_acked(conn: &quinn::Connection, msg: &Message) -> Result<()> {
+    let mut stream = conn.open_uni().await.map_err(net_err)?;
+    write_frame(&mut stream, msg).await?;
+    stream.finish().map_err(net_err)?;
+    match stream.stopped().await {
+        Ok(None) => Ok(()),
+        Ok(Some(code)) => Err(CoreError::Transport(format!("peer stopped the stream ({code})"))),
+        Err(e) => Err(net_err(e)),
+    }
 }
 
 fn pairing_timeout() -> CoreError {
@@ -231,7 +257,7 @@ impl Inner {
             peers.get(peer).map(|p| p.name.clone()).unwrap_or_default()
         };
         self.emit(Event::PeerOnline { peer, name, addr });
-        tokio::spawn(self.clone().serve(peer, conn));
+        tokio::spawn(self.clone().serve(peer, conn.clone()));
 
         let this = self.clone();
         tokio::spawn(async move {
@@ -241,14 +267,44 @@ impl Inner {
                 os: this.identity.os,
                 version: PROTOCOL_VERSION,
             };
-            let _ = this.send_to(peer, &hello).await;
-            let queued = this.queue.lock().unwrap().drain(peer);
-            for msg in queued {
-                if let Err(e) = this.send_to(peer, &msg).await {
-                    tracing::warn!("queued offer to {peer} failed: {e}");
+            let _ = send_on(&conn, &hello).await;
+            this.deliver_queued(peer, conn).await;
+        });
+    }
+
+    fn is_current(&self, peer: Uuid, conn: &quinn::Connection) -> bool {
+        self.conns.lock().unwrap().get(&peer).is_some_and(|c| c.conn.stable_id() == conn.stable_id())
+    }
+
+    /// Replays offers queued while `peer` was away. It waits for simultaneous dials to settle
+    /// and only uses `conn` while it is still the peer's connection, so a connection closed
+    /// as a duplicate or replaced never takes the queue with it. Offers that fail go back.
+    pub(super) async fn deliver_queued(self: Arc<Self>, peer: Uuid, mut conn: quinn::Connection) {
+        loop {
+            tokio::time::sleep(QUEUE_SETTLE).await;
+            if !self.is_current(peer, &conn) {
+                return;
+            }
+            let mut pending = self.queue.lock().unwrap().drain(peer).into_iter();
+            let mut failed = None;
+            for offer in pending.by_ref() {
+                let delivered = tokio::time::timeout(SEND_TIMEOUT, send_acked(&conn, &offer)).await;
+                if !matches!(delivered, Ok(Ok(()))) {
+                    failed = Some(offer);
+                    break;
                 }
             }
-        });
+            let Some(offer) = failed else { return };
+            tracing::warn!("queued offers to {peer} were not delivered; keeping them");
+            let mut rest = vec![offer];
+            rest.extend(pending);
+            self.queue.lock().unwrap().restore(peer, rest);
+            // A connection that took over meanwhile may have found the queue empty.
+            match self.connection(peer).filter(|c| c.stable_id() != conn.stable_id()) {
+                Some(newer) => conn = newer,
+                None => return,
+            }
+        }
     }
 
     async fn serve(self: Arc<Self>, peer: Uuid, conn: quinn::Connection) {
@@ -411,13 +467,21 @@ impl Inner {
             tracing::warn!("timeline insert failed: {e}");
         }
         self.emit(Event::LocalItem { item_id: item.id });
-        let offer = offer_for(&item, true);
+        let offer = Arc::new(offer_for(&item, true));
         let peers: Vec<Uuid> = self.peers.lock().unwrap().all().iter().map(|p| p.device_id).collect();
+        // One task per peer, so a slow or half-dead peer cannot hold up the others.
         for peer in peers {
-            let sent = self.connection(peer).is_some() && self.send_to(peer, &offer).await.is_ok();
-            if !sent {
-                self.queue.lock().unwrap().push(peer, &item);
-            }
+            let this = self.clone();
+            let offer = offer.clone();
+            tokio::spawn(async move {
+                let sent = match this.connection(peer) {
+                    Some(conn) => matches!(tokio::time::timeout(SEND_TIMEOUT, send_acked(&conn, &offer)).await, Ok(Ok(()))),
+                    None => false,
+                };
+                if !sent {
+                    this.queue.lock().unwrap().push_offer(peer, (*offer).clone());
+                }
+            });
         }
     }
 }

@@ -440,6 +440,52 @@ mod tests {
         node.shutdown();
     }
 
+    fn queue_three(node: &Node, peer: Uuid) -> Vec<Uuid> {
+        let items: Vec<ClipItem> =
+            (0..3).map(|i| ClipItem::new(node.device_id(), ClipPayload::Text(format!("queued {i}")))).collect();
+        let mut queue = node.inner.queue.lock().unwrap();
+        for item in &items {
+            queue.push(peer, item);
+        }
+        items.iter().map(|i| i.id).collect()
+    }
+
+    fn queued_ids(node: &Node, peer: Uuid) -> Vec<Uuid> {
+        node.inner
+            .queue
+            .lock()
+            .unwrap()
+            .drain(peer)
+            .into_iter()
+            .map(|m| match m {
+                Message::Offer { item_id, .. } => item_id,
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn queued_offers_stay_queued_unless_delivered_on_the_current_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, _clip) = node(dir.path()).await;
+        let peer = Uuid::new_v4();
+        let (current, _keep_current, _) = raw_connection(&node).await;
+        let (replaced, _keep_replaced, _) = raw_connection(&node).await;
+        node.inner.conns.lock().unwrap().insert(peer, Conn { conn: current.clone(), initiated_by_me: true });
+
+        // Closed as a duplicate or replaced: it must not take the queue with it.
+        let ids = queue_three(&node, peer);
+        node.inner.clone().deliver_queued(peer, replaced).await;
+        assert_eq!(queued_ids(&node, peer), ids);
+
+        // Still the current connection, but the sends fail: everything goes back in order.
+        let ids = queue_three(&node, peer);
+        current.close(0u32.into(), b"gone");
+        node.inner.clone().deliver_queued(peer, current).await;
+        assert_eq!(queued_ids(&node, peer), ids);
+        node.shutdown();
+    }
+
     #[tokio::test]
     async fn start_removes_leftover_spills() {
         let dir = tempfile::tempdir().unwrap();

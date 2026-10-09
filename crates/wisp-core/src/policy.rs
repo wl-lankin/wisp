@@ -39,6 +39,13 @@ pub fn on_offer(mode: DeliveryMode, kind: ItemKind, live: bool) -> OfferAction {
     }
 }
 
+fn not_live(offer: Message) -> Message {
+    match offer {
+        Message::Offer { item_id, kind, size, preview, .. } => Message::Offer { item_id, kind, size, preview, live: false },
+        other => other,
+    }
+}
+
 #[derive(Default)]
 pub struct OfferQueue {
     queues: HashMap<Uuid, VecDeque<Message>>,
@@ -52,8 +59,28 @@ impl OfferQueue {
     /// Replayed offers are not live, so an auto-sync receiver shows them instead of
     /// overwriting its clipboard with something stale.
     pub fn push(&mut self, peer: Uuid, item: &ClipItem) {
+        self.push_offer(peer, offer_for(item, false));
+    }
+
+    /// Queues an offer that could not be delivered; it is always replayed as not live.
+    pub fn push_offer(&mut self, peer: Uuid, offer: Message) {
         let q = self.queues.entry(peer).or_default();
-        q.push_back(offer_for(item, false));
+        q.push_back(not_live(offer));
+        while q.len() > OFFLINE_QUEUE_CAP {
+            q.pop_front();
+        }
+    }
+
+    /// Puts drained offers that could not be delivered back in front of anything queued
+    /// since, still keeping only the latest `OFFLINE_QUEUE_CAP`.
+    pub fn restore(&mut self, peer: Uuid, offers: Vec<Message>) {
+        if offers.is_empty() {
+            return;
+        }
+        let q = self.queues.entry(peer).or_default();
+        for offer in offers.into_iter().rev() {
+            q.push_front(not_live(offer));
+        }
         while q.len() > OFFLINE_QUEUE_CAP {
             q.pop_front();
         }
@@ -170,6 +197,43 @@ mod tests {
         assert!(matches!(drained.last(), Some(Message::Offer { item_id, .. }) if *item_id == last_id));
         assert!(q.drain(peer).is_empty());
         assert_eq!(q.drain(other).len(), 1);
+    }
+
+    fn offer_ids(offers: &[Message]) -> Vec<Uuid> {
+        offers
+            .iter()
+            .map(|m| match m {
+                Message::Offer { item_id, .. } => *item_id,
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn restored_offers_go_first_and_respect_the_cap() {
+        let mut q = OfferQueue::new();
+        let peer = Uuid::new_v4();
+        let old: Vec<ClipItem> = (0..3).map(|i| text_item(&format!("old {i}"))).collect();
+        for item in &old {
+            q.push(peer, item);
+        }
+        let drained = q.drain(peer);
+        let newer = text_item("queued meanwhile");
+        q.push_offer(peer, offer_for(&newer, true));
+        q.restore(peer, drained.clone());
+        let mut expected = offer_ids(&drained);
+        expected.push(newer.id);
+        let replay = q.drain(peer);
+        assert_eq!(offer_ids(&replay), expected);
+        assert!(replay.iter().all(|m| matches!(m, Message::Offer { live: false, .. })));
+
+        let many: Vec<ClipItem> = (0..OFFLINE_QUEUE_CAP).map(|i| text_item(&format!("new {i}"))).collect();
+        for item in &many {
+            q.push(peer, item);
+        }
+        q.restore(peer, drained);
+        let replay = q.drain(peer);
+        assert_eq!(offer_ids(&replay), many.iter().map(|i| i.id).collect::<Vec<_>>(), "older offers drop first");
     }
 
     #[test]
