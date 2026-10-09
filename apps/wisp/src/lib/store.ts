@@ -148,6 +148,14 @@ export function reduce(s: State, e: EngineEvent): boolean {
     case 'pairingFailed':
       notify(s, 'error', e.reason)
       return false
+    case 'deviceRenamed':
+      // Our own name changed; the snapshot carries it.
+      return true
+    case 'peerRenamed': {
+      const p = s.peers.find((x) => x.peer.deviceId === e.peer)
+      if (p) p.peer.name = e.name
+      return false
+    }
     case 'localItem':
       s.historyVersion++
       return false

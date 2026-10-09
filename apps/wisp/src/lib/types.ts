@@ -73,6 +73,8 @@ export interface AppSettings {
   autostart: boolean
   theme: Theme
   onboarded: boolean
+  historySize: number
+  shareScreenshotFiles: boolean
 }
 
 export type EngineEvent =
@@ -82,6 +84,8 @@ export type EngineEvent =
   | { type: 'discovered'; device: string; name: string; os: Os; addresses: string[] }
   | { type: 'identityChanged'; peer: string }
   | { type: 'paired'; peer: string; name: string }
+  | { type: 'deviceRenamed' }
+  | { type: 'peerRenamed'; peer: string; name: string }
   | { type: 'pairingFailed'; reason: string }
   | { type: 'localItem'; itemId: string }
   | ({ type: 'offerReceived' } & Offer)
