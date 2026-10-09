@@ -99,8 +99,25 @@ impl EventSink for GenerationSink {
     }
 }
 
-fn is_addr_in_use(e: &CoreError) -> bool {
-    matches!(e, CoreError::Io(io) if io.kind() == std::io::ErrorKind::AddrInUse)
+/// Why the preferred port could not be bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortProblem {
+    /// Taken right now, possibly by an older Wisp still letting go; worth a short retry.
+    Busy,
+    /// Never usable here (for example inside a Windows excluded port range); retrying cannot help.
+    Unavailable,
+}
+
+fn port_problem(e: &CoreError) -> Option<PortProblem> {
+    use std::io::ErrorKind;
+    match e {
+        CoreError::Io(io) => match io.kind() {
+            ErrorKind::AddrInUse => Some(PortProblem::Busy),
+            ErrorKind::PermissionDenied | ErrorKind::AddrNotAvailable => Some(PortProblem::Unavailable),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 #[derive(Default)]
@@ -138,13 +155,16 @@ impl Engine {
             Arc::new(GenerationSink { generation, current: self.generation.clone(), inner: sink });
         let deadline = tokio::time::Instant::now() + PORT_BUDGET;
         let (node, rx) = loop {
-            match Node::start(node_config(settings, paths, clipboard.clone(), preferred_port)).await {
+            let error = match Node::start(node_config(settings, paths, clipboard.clone(), preferred_port)).await {
                 Ok(started) => break started,
-                Err(e) if is_addr_in_use(&e) && tokio::time::Instant::now() < deadline => {
+                Err(e) => e,
+            };
+            match port_problem(&error) {
+                Some(PortProblem::Busy) if tokio::time::Instant::now() < deadline => {
                     tracing::debug!("port {preferred_port} busy, retrying");
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-                Err(e) if is_addr_in_use(&e) => {
+                Some(_) => {
                     tracing::warn!("port {preferred_port} unavailable, using a random port");
                     let started = Node::start(node_config(settings, paths, clipboard.clone(), 0))
                         .await
@@ -156,7 +176,7 @@ impl Engine {
                     }));
                     break started;
                 }
-                Err(e) => return Err(e.to_string()),
+                None => return Err(error.to_string()),
             }
         };
         tauri::async_runtime::spawn(pump(rx, sink.clone()));
@@ -273,6 +293,17 @@ mod tests {
         assert_eq!(values.len(), 1);
         assert_eq!(values[0]["message"], "old");
         assert_eq!(*recorder.reacted.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn port_errors_are_sorted_into_busy_and_unavailable() {
+        use std::io::{Error, ErrorKind};
+        let io = |kind: ErrorKind| CoreError::Io(Error::from(kind));
+        assert_eq!(port_problem(&io(ErrorKind::AddrInUse)), Some(PortProblem::Busy));
+        // A port inside a Windows excluded range (Hyper-V, WSL) reports PermissionDenied.
+        assert_eq!(port_problem(&io(ErrorKind::PermissionDenied)), Some(PortProblem::Unavailable));
+        assert_eq!(port_problem(&io(ErrorKind::AddrNotAvailable)), Some(PortProblem::Unavailable));
+        assert_eq!(port_problem(&io(ErrorKind::NotFound)), None);
     }
 
     #[tokio::test]
