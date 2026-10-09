@@ -8,6 +8,8 @@ use crate::peers::DeliveryMode;
 use crate::protocol::Message;
 
 pub const OFFLINE_QUEUE_CAP: usize = 20;
+/// The inbox keeps only this many offers; older ones drop first.
+pub const INBOX_CAP: usize = 100;
 
 pub fn offer_for(item: &ClipItem, live: bool) -> Message {
     let size = item.payload.size();
@@ -86,6 +88,10 @@ impl OfferQueue {
         }
     }
 
+    pub fn is_empty_for(&self, peer: Uuid) -> bool {
+        self.queues.get(&peer).is_none_or(|q| q.is_empty())
+    }
+
     pub fn drain(&mut self, peer: Uuid) -> Vec<Message> {
         self.queues.remove(&peer).map(Vec::from).unwrap_or_default()
     }
@@ -114,6 +120,10 @@ impl Inbox {
     pub fn add(&mut self, entry: InboxEntry) {
         self.entries.retain(|e| e.item_id != entry.item_id);
         self.entries.push(entry);
+        if self.entries.len() > INBOX_CAP {
+            let excess = self.entries.len() - INBOX_CAP;
+            self.entries.drain(..excess);
+        }
     }
 
     pub fn latest(&self) -> Option<&InboxEntry> {
@@ -258,5 +268,36 @@ mod tests {
         assert_eq!(inbox.latest().unwrap().item_id, a);
         assert_eq!(inbox.all().len(), 1);
         assert!(inbox.take(c).is_none());
+    }
+
+    #[test]
+    fn inbox_keeps_only_the_newest_entries() {
+        let mut inbox = Inbox::new();
+        let peer = Uuid::new_v4();
+        let mut last = Uuid::nil();
+        for _ in 0..(INBOX_CAP + 5) {
+            last = Uuid::new_v4();
+            inbox.add(InboxEntry {
+                peer,
+                item_id: last,
+                kind: ItemKind::Text,
+                size: 1,
+                preview: Preview::Text("x".into()),
+                received: Instant::now(),
+            });
+        }
+        assert_eq!(inbox.all().len(), INBOX_CAP);
+        assert_eq!(inbox.latest().unwrap().item_id, last);
+    }
+
+    #[test]
+    fn queue_reports_whether_a_peer_has_offers() {
+        let mut q = OfferQueue::new();
+        let peer = Uuid::new_v4();
+        assert!(q.is_empty_for(peer));
+        q.push(peer, &text_item("x"));
+        assert!(!q.is_empty_for(peer));
+        q.drain(peer);
+        assert!(q.is_empty_for(peer));
     }
 }

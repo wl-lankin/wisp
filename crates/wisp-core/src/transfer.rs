@@ -81,7 +81,7 @@ fn numbered_candidate(path: &Path, stem: &str, ext: Option<&str>, n: u32) -> Pat
 
 /// Atomically claims a free file name by creating an empty placeholder with
 /// `create_new`, so concurrent transfers can never pick the same target.
-async fn reserve_path(path: &Path) -> Result<PathBuf> {
+pub(crate) async fn reserve_path(path: &Path) -> Result<PathBuf> {
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
     let ext = path.extension().and_then(|s| s.to_str());
     let mut candidate = path.to_path_buf();

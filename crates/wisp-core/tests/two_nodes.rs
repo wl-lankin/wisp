@@ -354,3 +354,24 @@ async fn auto_sync_both_ways_with_a_reencoding_clipboard_does_not_bounce() {
         assert_eq!(node.history(&HistoryQuery::default()).unwrap().len(), 2, "one entry per copy, no echoes");
     }
 }
+
+#[tokio::test]
+async fn timeline_items_export_to_files() {
+    let mut a = start("Mac").await;
+    // The monitor snapshots the change count when it starts; a copy before that goes unseen.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    a.clip.set_external(ClipPayload::Text("export me".into()));
+    let Event::LocalItem { item_id } =
+        wait_for(&mut a.events, "local item", |e| matches!(e, Event::LocalItem { .. })).await
+    else {
+        unreachable!()
+    };
+    let out = tempfile::tempdir().unwrap();
+    let first = a.node.export_item(item_id, out.path()).await.unwrap();
+    let second = a.node.export_item(item_id, out.path()).await.unwrap();
+    assert_ne!(first, second);
+    assert_eq!(std::fs::read_to_string(&first).unwrap(), "export me");
+    assert_eq!(first.extension().unwrap(), "txt");
+    assert!(first.starts_with(out.path()));
+    assert!(a.node.export_item(uuid::Uuid::new_v4(), out.path()).await.is_err());
+}
