@@ -100,6 +100,20 @@ describe('ToastView', () => {
     w.unmount()
   })
 
+  it('comes back to show a clipboard error that arrives while hidden', async () => {
+    const { api, w } = await setup()
+    await vi.advanceTimersByTimeAsync(9000)
+    expect(api.hideWindow).toHaveBeenCalledTimes(1)
+    expect((w.element as HTMLElement).style.opacity).toBe('0')
+    pushNotice(state, 'error', "Couldn't write the clipboard. Try again.")
+    await flushPromises()
+    expect((w.element as HTMLElement).style.opacity).toBe('1')
+    expect(w.text()).toContain("Couldn't write the clipboard. Try again.")
+    await vi.advanceTimersByTimeAsync(30000)
+    expect(api.hideWindow).toHaveBeenCalledTimes(1)
+    w.unmount()
+  })
+
   it('shows the shortcut with Mac names on macOS', async () => {
     state.platform = 'macos'
     const { w } = await setup()

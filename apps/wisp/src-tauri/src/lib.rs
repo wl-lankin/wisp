@@ -56,6 +56,9 @@ impl EventSink for TauriSink {
                 let app = self.app.clone();
                 tauri::async_runtime::spawn(async move { tray::inbox_changed(&app).await });
             }
+            Event::Error { message } if message.contains("clipboard") => {
+                let _ = windows::show(&self.app, windows::View::Toast);
+            }
             _ => {}
         }
     }

@@ -19,9 +19,7 @@ const working = ref<string | null>(null)
 const isMac = computed(() => state.platform === 'macos')
 const hotkeyHint = computed(() => displayCombo(settings.value?.hotkey ?? 'Ctrl+Alt+V', isMac.value))
 
-/** Errors from before the toast last came back are old news and stay in the other windows. */
-let errorsAfter = 0
-const latestError = computed(() => [...state.notices].reverse().find((n) => n.kind === 'error' && n.id > errorsAfter) ?? null)
+const latestError = computed(() => [...state.notices].reverse().find((n) => n.kind === 'error') ?? null)
 
 const groups = computed(() =>
   groupOffers(state.inbox, (id) => state.peers.find((p) => p.peer.deviceId === id)?.peer.name ?? 'A device'),
@@ -31,15 +29,26 @@ const FADE_MS = 200
 let fadeTimer: ReturnType<typeof setTimeout> | undefined
 let lastHeight = 0
 
+function wake() {
+  clearTimeout(fadeTimer)
+  hidden.value = false
+  hovering.value = false
+  lastChange.value = Date.now()
+}
+
 // Every offer brings the toast back, even a repeat of one it already shows.
 watch(
   () => state.offerSeq,
   () => {
-    if (hidden.value) errorsAfter = state.notices.reduce((max, n) => Math.max(max, n.id), errorsAfter)
-    clearTimeout(fadeTimer)
-    hidden.value = false
-    hovering.value = false
-    lastChange.value = Date.now()
+    wake()
+  },
+)
+
+// A new error brings the toast back too, even when it had already hidden itself.
+watch(
+  () => latestError.value?.id,
+  (id, before) => {
+    if (id !== undefined && id !== before) wake()
   },
 )
 
