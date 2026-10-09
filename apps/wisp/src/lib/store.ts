@@ -64,6 +64,10 @@ export function applySnapshot(s: State, snap: Snapshot): void {
   s.inbox = snap.inbox
 }
 
+export function pushNotice(s: State, kind: Notice['kind'], text: string): void {
+  notify(s, kind, text)
+}
+
 function notify(s: State, kind: Notice['kind'], text: string): void {
   s.notices.push({ id: ++noticeSeq, kind, text })
   if (s.notices.length > MAX_NOTICES) s.notices.splice(0, s.notices.length - MAX_NOTICES)
