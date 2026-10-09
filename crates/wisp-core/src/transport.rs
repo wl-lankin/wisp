@@ -14,6 +14,8 @@ use crate::{CoreError, Result};
 
 pub const ALPN: &[u8] = b"wisp/1";
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+pub const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+pub const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct Transport {
@@ -25,6 +27,14 @@ pub struct Transport {
 
 fn tls_err(e: impl std::fmt::Display) -> CoreError {
     CoreError::Transport(e.to_string())
+}
+
+/// Shared by both directions: keep-alives stop idle peer connections from timing out.
+fn transport_config() -> Result<Arc<quinn::TransportConfig>> {
+    let mut config = quinn::TransportConfig::default();
+    config.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
+    config.max_idle_timeout(Some(quinn::IdleTimeout::try_from(MAX_IDLE_TIMEOUT).map_err(tls_err)?));
+    Ok(Arc::new(config))
 }
 
 impl Transport {
@@ -41,7 +51,8 @@ impl Transport {
             .map_err(tls_err)?;
         server_tls.alpn_protocols = vec![ALPN.to_vec()];
         let quic_server = QuicServerConfig::try_from(server_tls).map_err(tls_err)?;
-        let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
+        server_config.transport_config(transport_config()?);
 
         let endpoint = quinn::Endpoint::server(server_config, addr)?;
         Ok(Self { endpoint, cert, key_der: identity.key_der.clone(), provider })
@@ -118,7 +129,9 @@ impl Transport {
             .map_err(tls_err)?;
         client_tls.alpn_protocols = vec![ALPN.to_vec()];
         let quic_client = QuicClientConfig::try_from(client_tls).map_err(tls_err)?;
-        Ok(quinn::ClientConfig::new(Arc::new(quic_client)))
+        let mut config = quinn::ClientConfig::new(Arc::new(quic_client));
+        config.transport_config(transport_config()?);
+        Ok(config)
     }
 }
 

@@ -46,8 +46,12 @@ impl Inner {
     }
 
     pub(super) async fn request_pull(&self, peer: Uuid, item_id: Uuid) -> Result<()> {
-        self.pulls.lock().unwrap().insert(item_id);
-        self.send_to(peer, &Message::Pull { item_id }).await
+        self.pulls.lock().unwrap().insert(item_id, peer);
+        let result = self.send_to(peer, &Message::Pull { item_id }).await;
+        if result.is_err() {
+            self.pulls.lock().unwrap().remove(&item_id);
+        }
+        result
     }
 
     pub(super) fn spawn_accept_loop(self: Arc<Self>) {
@@ -85,14 +89,13 @@ impl Inner {
     }
 
     async fn accept_pairing(self: &Arc<Self>, conn: quinn::Connection, fp: Fingerprint) {
-        let code = match self.pairing.lock().unwrap().as_ref() {
-            Some(s) if s.is_open() => s.code().to_string(),
-            _ => String::new(),
-        };
-        if code.is_empty() {
+        // The attempt is counted before the exchange starts, so parallel connections cannot
+        // run more exchanges than the session allows.
+        let attempt = self.pairing.lock().unwrap().as_mut().and_then(|s| s.try_begin_attempt());
+        let Some((code, session_id)) = attempt else {
             conn.close(2u32.into(), b"not pairing");
             return;
-        }
+        };
         let exchange = async {
             let (send, recv) = conn.accept_bi().await.map_err(net_err)?;
             let mut stream = tokio::io::join(recv, send);
@@ -106,27 +109,33 @@ impl Inner {
             .unwrap_or_else(|_| Err(pairing_timeout()));
         match result {
             Ok(info) => {
-                *self.pairing.lock().unwrap() = None;
+                let current = {
+                    let mut guard = self.pairing.lock().unwrap();
+                    let current = guard.as_ref().is_some_and(|s| s.id() == session_id);
+                    if current {
+                        *guard = None;
+                    }
+                    current
+                };
+                if !current {
+                    conn.close(3u32.into(), b"pairing ended");
+                    self.emit(Event::PairingFailed { reason: "The pairing session has ended. Start pairing again.".into() });
+                    return;
+                }
                 if let Err(e) = self.finish_pairing(info, conn, false) {
                     self.emit(Event::PairingFailed { reason: e.to_string() });
                 }
             }
             Err(e) => {
-                let closed = {
+                let exhausted = {
                     let mut guard = self.pairing.lock().unwrap();
-                    match guard.as_mut() {
-                        Some(s) => {
-                            s.record_failure();
-                            let closed = !s.is_open();
-                            if closed {
-                                *guard = None;
-                            }
-                            closed
-                        }
-                        None => false,
+                    let exhausted = guard.as_ref().is_some_and(|s| s.id() == session_id && !s.is_open());
+                    if exhausted {
+                        *guard = None;
                     }
+                    exhausted
                 };
-                let reason = if closed {
+                let reason = if exhausted {
                     "Too many wrong codes. Start pairing again.".to_string()
                 } else {
                     e.to_string()
@@ -180,7 +189,10 @@ impl Inner {
             let mut conns = self.conns.lock().unwrap();
             if let Some(existing) = conns.get(&peer) {
                 let alive = existing.conn.close_reason().is_none();
-                let new_wins = (self.identity.device_id < peer) == initiated_by_me;
+                // A reconnect from the same side replaces a connection that may be stale;
+                // otherwise the connection initiated by the lower device ID wins.
+                let new_wins = existing.initiated_by_me == initiated_by_me
+                    || (self.identity.device_id < peer) == initiated_by_me;
                 if alive && !new_wins {
                     conn.close(0u32.into(), b"duplicate");
                     return;
@@ -189,7 +201,7 @@ impl Inner {
                     existing.conn.close(0u32.into(), b"replaced");
                 }
             }
-            conns.insert(peer, Conn { conn: conn.clone() });
+            conns.insert(peer, Conn { conn: conn.clone(), initiated_by_me });
         }
         let addr = conn.remote_address();
         let name = {
@@ -271,6 +283,11 @@ impl Inner {
                 }
             }
             Message::Offer { item_id, kind, size, preview, live } => {
+                let taken = self.inbox.lock().unwrap().all().iter().any(|e| e.item_id == item_id && e.peer != peer);
+                if taken {
+                    tracing::warn!("ignored an offer from {peer} for an item another peer already offered");
+                    return Ok(());
+                }
                 let mode = self.peers.lock().unwrap().get(peer).map(|p| p.mode).unwrap_or_default();
                 match on_offer(mode, kind, live) {
                     OfferAction::AutoPull => self.request_pull(peer, item_id).await?,
@@ -304,8 +321,17 @@ impl Inner {
         }
     }
 
-    async fn apply_remote(self: &Arc<Self>, peer: Uuid, item_id: Uuid, payload: ClipPayload) {
-        if !self.pulls.lock().unwrap().remove(&item_id) {
+    /// Applies a `Push` only when this device asked exactly this peer for the item.
+    pub(super) async fn apply_remote(self: &Arc<Self>, peer: Uuid, item_id: Uuid, payload: ClipPayload) {
+        let requested = {
+            let mut pulls = self.pulls.lock().unwrap();
+            let asked = pulls.get(&item_id) == Some(&peer);
+            if asked {
+                pulls.remove(&item_id);
+            }
+            asked
+        };
+        if !requested {
             tracing::warn!("ignored an unrequested push from {peer}");
             return;
         }
@@ -323,6 +349,9 @@ impl Inner {
     pub(super) async fn serve_pull(self: &Arc<Self>, peer: Uuid, item_id: Uuid) -> Result<()> {
         let item = self.history.lock().unwrap().load(item_id)?;
         let item = item.ok_or_else(|| CoreError::Transfer(format!("item {item_id} is no longer in the timeline")))?;
+        if item.source != self.identity.device_id {
+            return Err(CoreError::Transfer(format!("item {item_id} is not from this device")));
+        }
         self.send_to(peer, &Message::Push { item_id, payload: item.payload }).await
     }
 

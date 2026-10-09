@@ -3,13 +3,18 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::Serialize;
 use tempfile::TempDir;
 use tokio::sync::mpsc::UnboundedReceiver;
 use wisp_core::clipboard::MemoryClipboard;
 use wisp_core::engine::{Event, Node, NodeConfig};
 use wisp_core::history::HistoryQuery;
+use wisp_core::identity::Identity;
 use wisp_core::item::{ClipPayload, Preview};
+use wisp_core::pairing::pair;
 use wisp_core::peers::DeliveryMode;
+use wisp_core::protocol::write_value;
+use wisp_core::transport::Transport;
 
 struct TestNode {
     node: Node,
@@ -95,6 +100,63 @@ async fn three_wrong_codes_close_the_pairing_session() {
     })
     .await;
     assert!(a.node.pair_with(b.addr(), &code).await.is_err());
+    assert!(b.node.peers().is_empty());
+}
+
+/// Mirrors the engine's private bidirectional stream header on the wire.
+#[derive(Serialize)]
+enum StreamKind {
+    Pair,
+}
+
+/// Opens a pairing stream to `addr` and sends its header, but does not start the exchange.
+async fn open_pairing_stream(
+    transport: &Transport,
+    addr: SocketAddr,
+) -> (quinn::Connection, tokio::io::Join<quinn::RecvStream, quinn::SendStream>) {
+    let conn = transport.connect(addr, None).await.unwrap();
+    let (send, recv) = conn.open_bi().await.unwrap();
+    let mut stream = tokio::io::join(recv, send);
+    write_value(&mut stream, &StreamKind::Pair).await.unwrap();
+    (conn, stream)
+}
+
+#[tokio::test]
+async fn connections_held_open_cannot_exceed_the_attempt_limit() {
+    let mut b = start("PC").await;
+    let code = b.node.begin_pairing();
+    let wrong = if code == "000000" { "111111" } else { "000000" };
+    let attacker = Identity::generate("Attacker").unwrap();
+    let transport = Transport::bind(&attacker, "127.0.0.1:0".parse().unwrap()).unwrap();
+
+    let mut held = Vec::new();
+    for _ in 0..4 {
+        held.push(open_pairing_stream(&transport, b.addr()).await);
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (_last_conn, mut last) = held.pop().unwrap();
+
+    let guesses: Vec<_> = held
+        .into_iter()
+        .map(|(conn, mut stream)| {
+            let attacker = attacker.clone();
+            tokio::spawn(async move {
+                let result = pair(&mut stream, wrong, &attacker, None).await;
+                drop(conn);
+                result
+            })
+        })
+        .collect();
+    for guess in guesses {
+        assert!(guess.await.unwrap().is_err());
+    }
+    wait_for(&mut b.events, "session closed", |e| {
+        matches!(e, Event::PairingFailed { reason } if reason.contains("Too many"))
+    })
+    .await;
+
+    assert!(pair(&mut last, &code, &attacker, None).await.is_err());
+    tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(b.node.peers().is_empty());
 }
 

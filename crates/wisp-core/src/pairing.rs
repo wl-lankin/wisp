@@ -99,15 +99,23 @@ fn mac_of(key: &[u8; 32], sender_msg: &[u8], info: &PairInfo) -> Result<blake3::
     Ok(blake3::keyed_hash(key, &data))
 }
 
+/// A pairing session on the device that shows the code. Every exchange counts as an attempt
+/// from the moment it begins, so exchanges running in parallel cannot exceed the limit.
 pub struct PairingSession {
+    id: Uuid,
     code: String,
-    failures: u8,
+    attempts: u8,
 }
 
 impl PairingSession {
     pub fn new() -> Self {
         let n: u32 = rand::rngs::OsRng.gen_range(0..1_000_000);
-        Self { code: format!("{n:06}"), failures: 0 }
+        Self { id: Uuid::new_v4(), code: format!("{n:06}"), attempts: 0 }
+    }
+
+    /// Identifies this session, so a late result cannot act on a newer session.
+    pub fn id(&self) -> Uuid {
+        self.id
     }
 
     pub fn code(&self) -> &str {
@@ -115,11 +123,21 @@ impl PairingSession {
     }
 
     pub fn is_open(&self) -> bool {
-        self.failures < MAX_PAIRING_FAILURES
+        self.attempts < MAX_PAIRING_FAILURES
     }
 
     pub fn record_failure(&mut self) {
-        self.failures = self.failures.saturating_add(1);
+        self.attempts = self.attempts.saturating_add(1);
+    }
+
+    /// Starts an attempt and returns the code and session id, or `None` once the attempts
+    /// are used up.
+    pub fn try_begin_attempt(&mut self) -> Option<(String, Uuid)> {
+        if !self.is_open() {
+            return None;
+        }
+        self.attempts += 1;
+        Some((self.code.clone(), self.id))
     }
 }
 
@@ -186,6 +204,20 @@ mod tests {
         assert!(s.is_open());
         s.record_failure();
         assert!(!s.is_open());
+    }
+
+    #[test]
+    fn attempts_are_counted_when_they_begin() {
+        let mut s = PairingSession::new();
+        let code = s.code().to_string();
+        let (first_code, first_id) = s.try_begin_attempt().unwrap();
+        assert_eq!(first_code, code);
+        let (_, second_id) = s.try_begin_attempt().unwrap();
+        assert_eq!(first_id, second_id);
+        assert!(s.try_begin_attempt().is_some());
+        assert!(s.try_begin_attempt().is_none());
+        assert!(!s.is_open());
+        assert_ne!(PairingSession::new().id(), first_id);
     }
 
     #[tokio::test]
