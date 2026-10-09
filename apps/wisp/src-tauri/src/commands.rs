@@ -55,14 +55,24 @@ pub fn get_settings(state: State<'_, AppState>) -> AppSettings {
 }
 
 fn save_settings(app: &AppHandle, state: &AppState, next: AppSettings) -> Cmd<AppSettings> {
-    next.save(&state.settings_path)?;
-    *state.settings.lock().unwrap() = next.clone();
+    {
+        let mut current = state.settings.lock().unwrap();
+        next.save(&state.settings_path)?;
+        *current = next.clone();
+    }
     let _ = app.emit("wisp://settings", &next);
     Ok(next)
 }
 
 #[tauri::command]
-pub async fn update_settings(app: AppHandle, state: State<'_, AppState>, next: AppSettings) -> Cmd<AppSettings> {
+pub async fn update_settings(app: AppHandle, state: State<'_, AppState>, mut next: AppSettings) -> Cmd<AppSettings> {
+    if let Some(name) = next.device_name.take() {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("Please give this device a name".into());
+        }
+        next.device_name = Some(name.chars().take(64).collect());
+    }
     let previous = state.settings.lock().unwrap().clone();
     let saved = save_settings(&app, &state, next)?;
     if saved.onboarded && saved.save_dir != previous.save_dir {
@@ -142,20 +152,33 @@ fn save_dir(state: &AppState) -> PathBuf {
     settings.save_dir.clone().unwrap_or_else(|| state.paths.default_save_dir.clone())
 }
 
-/// Catches an offer, waits until it is in the timeline, writes it to the save folder and reveals it.
+/// Catches an offer and saves it to the save folder. Files arrive straight in the folder, which is
+/// opened; clipboard items are written from the timeline once they have landed there.
 #[tauri::command]
 pub async fn save_offer(app: AppHandle, state: State<'_, AppState>, item_id: Uuid) -> Cmd<String> {
     let node = state.engine.node().await?;
+    let kind = node.inbox().iter().find(|o| o.item_id == item_id).map(|o| o.kind);
+    let kind = kind.ok_or_else(|| "This offer is no longer available".to_string())?;
     node.catch(item_id).await.map_err(err)?;
     let dir = save_dir(&state);
-    for _ in 0..50 {
-        if let Ok(path) = node.export_item(item_id, &dir).await {
-            let _ = app.opener().reveal_item_in_dir(&path);
-            return Ok(path.to_string_lossy().into_owned());
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+    if kind == ItemKind::File {
+        tokio::fs::create_dir_all(&dir).await.map_err(err)?;
+        let _ = app.opener().open_path(dir.to_string_lossy(), None::<&str>);
+        return Ok(dir.to_string_lossy().into_owned());
     }
-    Err("The item did not arrive in time. Try again.".into())
+    for _ in 0..50 {
+        match node.export_item(item_id, &dir).await {
+            Ok(path) => {
+                let _ = app.opener().reveal_item_in_dir(&path);
+                return Ok(path.to_string_lossy().into_owned());
+            }
+            Err(e) if e.to_string().contains("no longer in the timeline") => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(e) => return Err(err(e)),
+        }
+    }
+    Err("The item did not arrive in time. It may still appear in the Timeline.".into())
 }
 
 #[tauri::command]
@@ -166,7 +189,7 @@ pub async fn history(
     kind: Option<ItemKind>,
     limit: Option<usize>,
 ) -> Cmd<Vec<Value>> {
-    let q = HistoryQuery { text, source, kind, limit: limit.unwrap_or(200) };
+    let q = HistoryQuery { text, source, kind, limit: limit.unwrap_or(200).min(500) };
     let entries = state.engine.node().await?.history(&q).map_err(err)?;
     Ok(entries.iter().map(|e| with_ui_preview(e, &e.preview)).collect())
 }

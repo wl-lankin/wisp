@@ -1,5 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,12 +8,14 @@ use serde_json::Value;
 use tokio::sync::{mpsc, Mutex};
 use wisp_core::clipboard::{ClipboardBackend, SystemClipboard};
 use wisp_core::engine::{Event, Node, NodeConfig};
+use wisp_core::CoreError;
 
 use crate::dto::event_to_ui;
 use crate::settings::AppSettings;
 
 pub const DEFAULT_PORT: u16 = 47800;
-const PORT_RETRIES: u32 = 5;
+const PORT_BUDGET: Duration = Duration::from_secs(3);
+const SHUTDOWN_BUDGET: Duration = Duration::from_secs(3);
 
 /// Where engine events go: the Tauri app in production, a recorder in tests.
 pub trait EventSink: Send + Sync + 'static {
@@ -69,38 +72,96 @@ pub fn parse_peer_addr(input: &str) -> Result<SocketAddr, String> {
         .map_err(|_| format!("\"{t}\" is not an IP address"))
 }
 
+/// Forwards events only while its generation is the newest, so a replaced node's pump goes quiet.
+struct GenerationSink {
+    generation: u64,
+    current: Arc<AtomicU64>,
+    inner: Arc<dyn EventSink>,
+}
+
+impl GenerationSink {
+    fn is_current(&self) -> bool {
+        self.current.load(Ordering::SeqCst) == self.generation
+    }
+}
+
+impl EventSink for GenerationSink {
+    fn emit(&self, value: Value) {
+        if self.is_current() {
+            self.inner.emit(value);
+        }
+    }
+
+    fn react(&self, event: &Event) {
+        if self.is_current() {
+            self.inner.react(event);
+        }
+    }
+}
+
+fn is_addr_in_use(e: &CoreError) -> bool {
+    matches!(e, CoreError::Io(io) if io.kind() == std::io::ErrorKind::AddrInUse)
+}
+
 #[derive(Default)]
 pub struct Engine {
     node: Mutex<Option<Node>>,
     clipboard: Mutex<Option<Arc<dyn ClipboardBackend>>>,
+    generation: Arc<AtomicU64>,
 }
 
 impl Engine {
+    #[cfg(test)]
+    fn with_clipboard(clipboard: Arc<dyn ClipboardBackend>) -> Self {
+        Self { clipboard: Mutex::new(Some(clipboard)), ..Self::default() }
+    }
+
     pub async fn start(&self, settings: &AppSettings, paths: &Paths, sink: Arc<dyn EventSink>) -> Result<(), String> {
+        self.start_on(settings, paths, sink, DEFAULT_PORT).await
+    }
+
+    async fn start_on(
+        &self,
+        settings: &AppSettings,
+        paths: &Paths,
+        sink: Arc<dyn EventSink>,
+        preferred_port: u16,
+    ) -> Result<(), String> {
         let mut slot = self.node.lock().await;
+        // Silence the old pump first; its node may still emit while it winds down.
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         if let Some(old) = slot.take() {
-            old.shutdown();
+            old.shutdown_and_wait(SHUTDOWN_BUDGET).await;
         }
         let clipboard = self.clipboard().await?;
-        let mut attempt = 0;
+        let sink: Arc<dyn EventSink> =
+            Arc::new(GenerationSink { generation, current: self.generation.clone(), inner: sink });
+        let deadline = tokio::time::Instant::now() + PORT_BUDGET;
         let (node, rx) = loop {
-            match Node::start(node_config(settings, paths, clipboard.clone(), DEFAULT_PORT)).await {
+            match Node::start(node_config(settings, paths, clipboard.clone(), preferred_port)).await {
                 Ok(started) => break started,
-                Err(e) if attempt < PORT_RETRIES => {
-                    attempt += 1;
-                    tracing::debug!("port {DEFAULT_PORT} busy ({e}), retrying");
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                Err(e) if is_addr_in_use(&e) && tokio::time::Instant::now() < deadline => {
+                    tracing::debug!("port {preferred_port} busy, retrying");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-                Err(e) => {
-                    tracing::warn!("port {DEFAULT_PORT} unavailable ({e}), using a random port");
-                    break Node::start(node_config(settings, paths, clipboard.clone(), 0))
+                Err(e) if is_addr_in_use(&e) => {
+                    tracing::warn!("port {preferred_port} unavailable, using a random port");
+                    let started = Node::start(node_config(settings, paths, clipboard.clone(), 0))
                         .await
                         .map_err(|e| e.to_string())?;
+                    let port = started.0.local_addr().map(|a| a.port()).unwrap_or_default();
+                    sink.emit(serde_json::json!({
+                        "type": "error",
+                        "message": format!("Port {preferred_port} was busy, Wisp is using port {port} for now"),
+                    }));
+                    break started;
                 }
+                Err(e) => return Err(e.to_string()),
             }
         };
-        tauri::async_runtime::spawn(pump(rx, sink));
+        tauri::async_runtime::spawn(pump(rx, sink.clone()));
         *slot = Some(node);
+        sink.emit(serde_json::json!({ "type": "engineRestarted" }));
         Ok(())
     }
 
@@ -109,8 +170,9 @@ impl Engine {
     }
 
     pub async fn stop(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
         if let Some(node) = self.node.lock().await.take() {
-            node.shutdown();
+            node.shutdown_and_wait(SHUTDOWN_BUDGET).await;
         }
     }
 
@@ -191,5 +253,46 @@ mod tests {
         assert_eq!(values[0]["type"], "peerOffline");
         assert_eq!(values[1]["message"], "x");
         assert_eq!(*sink.reacted.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn stale_generation_forwards_nothing() {
+        let current = Arc::new(AtomicU64::new(1));
+        let recorder = Arc::new(Recorder { values: StdMutex::new(vec![]), reacted: StdMutex::new(0) });
+        let sink: Arc<dyn EventSink> =
+            Arc::new(GenerationSink { generation: 1, current: current.clone(), inner: recorder.clone() });
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(pump(rx, sink));
+        tx.send(Event::Error { message: "old".into() }).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        current.store(2, Ordering::SeqCst);
+        tx.send(Event::Error { message: "stale".into() }).unwrap();
+        drop(tx);
+        task.await.unwrap();
+        let values = recorder.values.lock().unwrap();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["message"], "old");
+        assert_eq!(*recorder.reacted.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn restart_reuses_the_port_and_announces_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { data_dir: dir.path().join("data"), default_save_dir: dir.path().join("save") };
+        let port = std::net::UdpSocket::bind(("0.0.0.0", 0)).unwrap().local_addr().unwrap().port();
+        let engine = Engine::with_clipboard(Arc::new(MemoryClipboard::new()));
+        let recorder = Arc::new(Recorder { values: StdMutex::new(vec![]), reacted: StdMutex::new(0) });
+        let settings = AppSettings::default();
+
+        engine.start_on(&settings, &paths, recorder.clone(), port).await.unwrap();
+        assert_eq!(engine.node().await.unwrap().local_addr().unwrap().port(), port);
+        engine.start_on(&settings, &paths, recorder.clone(), port).await.unwrap();
+        assert_eq!(engine.node().await.unwrap().local_addr().unwrap().port(), port);
+
+        engine.stop().await;
+        let values = recorder.values.lock().unwrap();
+        let restarts = values.iter().filter(|v| v["type"] == "engineRestarted").count();
+        assert_eq!(restarts, 2);
+        assert!(values.iter().all(|v| v["type"] != "error"), "no port fallback expected: {values:?}");
     }
 }

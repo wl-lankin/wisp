@@ -151,7 +151,9 @@ impl Node {
         // tmp only holds clipboard spills of a previous run, which may carry secrets.
         let tmp_dir = cfg.data_dir.join("tmp");
         match std::fs::remove_dir_all(&tmp_dir) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                tracing::warn!("could not clear the spill folder: {e}");
+            }
             _ => {}
         }
         create_private_dir(&tmp_dir)?;
@@ -376,6 +378,17 @@ impl Node {
         }
         self.inner.transport.close();
     }
+
+    /// Shuts down, then waits until every background task released the node (and with it the
+    /// bound socket), or until `budget` elapses. Other clones of this handle delay the release.
+    pub async fn shutdown_and_wait(&self, budget: Duration) {
+        self.shutdown();
+        let deadline = tokio::time::Instant::now() + budget;
+        let _ = tokio::time::timeout(budget, self.inner.transport.wait_idle()).await;
+        while Arc::strong_count(&self.inner) > 1 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -446,6 +459,26 @@ mod tests {
             addresses: vec![],
             mode: DeliveryMode::Catch,
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_and_wait_returns_quickly_and_frees_the_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, _clip, _rx) = start_node(dir.path()).await;
+        let port = node.local_addr().unwrap().port();
+        let began = Instant::now();
+        node.shutdown_and_wait(Duration::from_secs(3)).await;
+        assert!(began.elapsed() < Duration::from_secs(2));
+        drop(node);
+        let mut freed = false;
+        for _ in 0..50 {
+            if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(freed, "port {port} should be free again");
     }
 
     #[tokio::test]
