@@ -455,9 +455,17 @@ impl Inner {
     pub(super) fn spawn_clipboard_loop(self: Arc<Self>, poll: Duration) {
         let mut rx = spawn_monitor(self.clipboard.clone(), self.echo.clone(), poll);
         tokio::spawn(async move {
-            while let Some(payload) = rx.recv().await {
-                self.on_local(payload).await;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = self.closed_signal() => break,
+                    payload = rx.recv() => match payload {
+                        Some(payload) => self.on_local(payload).await,
+                        None => break,
+                    },
+                }
             }
+            // Dropping `rx` here also stops the monitor on its next poll.
         });
     }
 

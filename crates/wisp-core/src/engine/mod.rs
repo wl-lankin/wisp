@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
 use crate::clipboard::{write_and_mark, ClipboardBackend, EchoGuard};
@@ -131,6 +131,8 @@ struct Inner {
     /// Peers with a dial in flight, so ticks and manual adds do not stack dials.
     dialing: Mutex<HashSet<Uuid>>,
     closed: AtomicBool,
+    /// Flips to true on shutdown and wakes every background loop that waits on it.
+    shutdown: watch::Sender<bool>,
 }
 
 #[derive(Clone)]
@@ -141,7 +143,6 @@ pub struct Node {
 impl Node {
     pub async fn start(cfg: NodeConfig) -> Result<(Node, mpsc::UnboundedReceiver<Event>)> {
         let identity = Identity::load_or_create(&cfg.data_dir.join("identity.json"), &cfg.device_name)?;
-        let transport = Transport::bind(&identity, cfg.bind)?;
         let peers = PeerStore::open(&cfg.data_dir.join("peers.json"))?;
         let history = History::open(&cfg.data_dir.join("history"))?;
         std::fs::create_dir_all(&cfg.save_dir)?;
@@ -153,8 +154,11 @@ impl Node {
         }
         create_private_dir(&tmp_dir)?;
         cleanup_partials(&cfg.save_dir, RESUME_WINDOW)?;
+        // Bound last: nothing after this fails, so an Err never leaves a socket or task behind.
+        let transport = Transport::bind(&identity, cfg.bind)?;
 
         let (events, rx) = mpsc::unbounded_channel();
+        let (shutdown, _) = watch::channel(false);
         let inner = Arc::new(Inner {
             identity,
             transport,
@@ -174,12 +178,20 @@ impl Node {
             discovered: Mutex::new(DiscoveredSet::new()),
             dialing: Mutex::new(HashSet::new()),
             closed: AtomicBool::new(false),
+            shutdown,
         });
+        if cfg.discovery {
+            // Without discovery, paired devices are still dialed at their remembered addresses.
+            if let Err(e) = inner.start_discovery() {
+                tracing::warn!("discovery failed to start: {e}");
+                inner.emit(Event::Error {
+                    message: "Couldn't look for nearby devices. Paired devices still connect at their last known address."
+                        .into(),
+                });
+            }
+        }
         inner.clone().spawn_accept_loop();
         inner.clone().spawn_clipboard_loop(cfg.clipboard_poll);
-        if cfg.discovery {
-            inner.start_discovery()?;
-        }
         inner.clone().spawn_dialer(cfg.dial_interval);
         Ok((Node { inner }, rx))
     }
@@ -339,6 +351,7 @@ impl Node {
 
     pub fn shutdown(&self) {
         self.inner.closed.store(true, Ordering::SeqCst);
+        self.inner.shutdown.send_replace(true);
         if let Some(d) = self.inner.discovery.lock().unwrap().take() {
             d.stop();
         }
@@ -558,6 +571,41 @@ mod tests {
             preview: Preview::Text("hi".into()),
         };
         assert_eq!(serde_json::to_value(entry).unwrap()["createdMs"], 7);
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_the_engine_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, _clip) = node(dir.path()).await;
+        let state = Arc::downgrade(&node.inner);
+        node.shutdown();
+        drop(node);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while state.strong_count() > 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(state.strong_count(), 0, "a background task still holds the engine");
+    }
+
+    #[tokio::test]
+    async fn a_failed_start_leaves_the_port_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        // A file where the timeline folder should be makes start fail.
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        std::fs::write(dir.path().join("data").join("history"), b"").unwrap();
+        let cfg = NodeConfig {
+            data_dir: dir.path().join("data"),
+            save_dir: dir.path().join("save"),
+            device_name: "Test".into(),
+            bind: SocketAddr::from(([127, 0, 0, 1], port)),
+            discovery: false,
+            clipboard: Arc::new(MemoryClipboard::new()),
+            clipboard_poll: Duration::from_millis(20),
+            dial_interval: Duration::from_millis(200),
+        };
+        assert!(Node::start(cfg).await.is_err());
+        std::net::UdpSocket::bind(("127.0.0.1", port)).expect("the failed start kept the port bound");
     }
 
     #[tokio::test]

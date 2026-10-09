@@ -139,12 +139,17 @@ impl Discovery {
         let daemon = ServiceDaemon::new().map_err(mdns_err)?;
         let instance = advert.device_id.to_string();
         let host = format!("{instance}.local.");
-        let info = ServiceInfo::new(SERVICE_TYPE, &instance, &host, "", advert.port, txt_properties(advert))
-            .map_err(mdns_err)?
-            .enable_addr_auto();
-        daemon.register(info).map_err(mdns_err)?;
-
-        let browse = daemon.browse(SERVICE_TYPE).map_err(mdns_err)?;
+        let registered = ServiceInfo::new(SERVICE_TYPE, &instance, &host, "", advert.port, txt_properties(advert))
+            .and_then(|info| daemon.register(info.enable_addr_auto()))
+            .and_then(|()| daemon.browse(SERVICE_TYPE));
+        let browse = match registered {
+            Ok(browse) => browse,
+            Err(e) => {
+                // The daemon runs its own thread; stop it so a failed start leaves nothing behind.
+                let _ = daemon.shutdown();
+                return Err(mdns_err(e));
+            }
+        };
         let (tx, rx) = mpsc::unbounded_channel();
         let own_id = advert.device_id;
         tokio::spawn(async move {

@@ -13,15 +13,22 @@ impl Inner {
         self.closed.load(Ordering::SeqCst)
     }
 
+    /// Resolves once the node is shut down (right away if it already is).
+    pub(super) async fn closed_signal(&self) {
+        let mut rx = self.shutdown.subscribe();
+        let _ = rx.wait_for(|closed| *closed).await;
+    }
+
     /// Periodically dials every paired peer that is not connected, using remembered and
     /// discovered addresses. Both sides dial; `register` keeps one connection.
     pub(super) fn spawn_dialer(self: Arc<Self>, every: Duration) {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(every);
             loop {
-                ticker.tick().await;
-                if self.is_closed() {
-                    break;
+                tokio::select! {
+                    biased;
+                    _ = self.closed_signal() => break,
+                    _ = ticker.tick() => {}
                 }
                 let offline: Vec<Uuid> = {
                     let peers = self.peers.lock().unwrap();
