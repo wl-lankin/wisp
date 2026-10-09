@@ -187,10 +187,21 @@ impl History {
             let rows = stmt.query_map([self.cap as i64], |r| r.get::<_, String>(0))?;
             rows.collect::<std::result::Result<_, _>>()?
         };
-        for id in stale {
-            self.conn.execute("DELETE FROM items WHERE id = ?1", [&id])?;
-            self.conn.execute("DELETE FROM items_fts WHERE id = ?1", [&id])?;
-            let _ = std::fs::remove_file(self.blobs.join(format!("{id}.bin")));
+        if stale.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        for id in &stale {
+            tx.execute("DELETE FROM items WHERE id = ?1", [id])?;
+            tx.execute("DELETE FROM items_fts WHERE id = ?1", [id])?;
+        }
+        tx.commit()?;
+        for id in &stale {
+            if let Err(e) = std::fs::remove_file(self.blobs.join(format!("{id}.bin"))) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!("could not remove a pruned timeline blob: {e}");
+                }
+            }
         }
         Ok(())
     }
@@ -370,6 +381,31 @@ mod tests {
         assert!(h.set_cap(MIN_HISTORY - 1).is_err());
         assert!(h.set_cap(MAX_HISTORY + 1).is_err());
         assert_eq!(h.cap(), HISTORY_CAP);
+    }
+
+    #[test]
+    fn a_large_shrink_prunes_in_one_go_and_removes_every_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = History::open(dir.path()).unwrap();
+        let src = Uuid::new_v4();
+        let ids: Vec<Uuid> = (0..300)
+            .map(|i| {
+                let it = item(src, &format!("n{i}"));
+                h.insert(&it).unwrap();
+                it.id
+            })
+            .collect();
+        h.set_cap(20).unwrap();
+        assert_eq!(h.count().unwrap(), 20);
+        for id in &ids[..280] {
+            assert_eq!(h.load(*id).unwrap(), None);
+            assert!(!dir.path().join("blobs").join(format!("{id}.bin")).exists());
+        }
+        for id in &ids[280..] {
+            assert!(h.load(*id).unwrap().is_some());
+        }
+        let blobs = std::fs::read_dir(dir.path().join("blobs")).unwrap().count();
+        assert_eq!(blobs, 20);
     }
 
     #[test]
