@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
 import { reactive, ref } from 'vue'
-import { initialState, pushNotice, reduce } from '../lib/store'
+import { applySnapshot, initialState, pushNotice, reduce } from '../lib/store'
 import type { Offer } from '../lib/types'
 
 const state = reactive(initialState())
@@ -111,6 +111,28 @@ describe('ToastView', () => {
     expect(w.text()).toContain("Couldn't write the clipboard. Try again.")
     await vi.advanceTimersByTimeAsync(30000)
     expect(api.hideWindow).toHaveBeenCalledTimes(1)
+    w.unmount()
+  })
+
+  it('shows a clipboard error that happened before this window existed', async () => {
+    Object.assign(state, { ready: false, inbox: [] })
+    const { api, w } = await setup()
+    await vi.advanceTimersByTimeAsync(2000)
+    applySnapshot(state, {
+      deviceId: 'd',
+      deviceName: 'PC',
+      platform: 'windows',
+      port: 1,
+      peers: [],
+      nearby: [],
+      inbox: [],
+      clipboardError: { seq: 1, message: "Couldn't write the clipboard. Try again." },
+    })
+    await flushPromises()
+    expect((w.element as HTMLElement).style.opacity).toBe('1')
+    expect(w.text()).toContain("Couldn't write the clipboard. Try again.")
+    await vi.advanceTimersByTimeAsync(30000)
+    expect(api.hideWindow).not.toHaveBeenCalled()
     w.unmount()
   })
 

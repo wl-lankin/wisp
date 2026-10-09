@@ -134,6 +134,25 @@ describe('reduce', () => {
     expect(s.notices).toHaveLength(1)
   })
 
+  it('shows a clipboard error that only the snapshot carries, once', () => {
+    const s = initialState()
+    const clipboardError = { seq: 1, message: "Couldn't write the clipboard. Try again." }
+    applySnapshot(s, { ...snap(), clipboardError })
+    applySnapshot(s, { ...snap(), clipboardError })
+    expect(s.notices.filter((n) => n.kind === 'error' && n.text.includes('clipboard'))).toHaveLength(1)
+    applySnapshot(s, { ...snap(), clipboardError: { seq: 2, message: "Couldn't write the clipboard. Try again." } })
+    expect(s.notices).toHaveLength(2)
+    applySnapshot(s, { ...snap(), clipboardError: null })
+    expect(s.notices).toHaveLength(2)
+  })
+
+  it('does not repeat a clipboard error the window already saw live', () => {
+    const s = initialState()
+    reduce(s, { type: 'error', message: "Couldn't write the clipboard. Try again.", seq: 3 })
+    applySnapshot(s, { ...snap(), clipboardError: { seq: 3, message: "Couldn't write the clipboard. Try again." } })
+    expect(s.notices).toHaveLength(1)
+  })
+
   it('reloads when another window changed the inbox or the peers', () => {
     const s = initialState()
     expect(reduce(s, { type: 'inboxChanged' })).toBe(true)

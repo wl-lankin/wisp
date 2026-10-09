@@ -35,6 +35,13 @@ pub struct Snapshot {
     nearby: Vec<NearbyDevice>,
     inbox: Vec<Value>,
     hotkey_error: Option<String>,
+    clipboard_error: Option<ClipboardErrorDto>,
+}
+
+#[derive(Serialize)]
+struct ClipboardErrorDto {
+    seq: u64,
+    message: String,
 }
 
 #[tauri::command]
@@ -49,6 +56,12 @@ pub async fn snapshot(state: State<'_, AppState>) -> Cmd<Snapshot> {
         nearby: node.nearby(),
         inbox: node.inbox().iter().map(|o| with_ui_preview(o, &o.preview)).collect(),
         hotkey_error: state.hotkey_error.lock().unwrap().clone(),
+        clipboard_error: state
+            .clipboard_error
+            .lock()
+            .unwrap()
+            .current()
+            .map(|(seq, message)| ClipboardErrorDto { seq, message }),
     })
 }
 
