@@ -1,1 +1,105 @@
 @import 'tailwindcss';
+@import '@fontsource-variable/geist';
+@import '@fontsource-variable/geist-mono';
+
+@theme {
+  --font-sans: 'Geist Variable', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'Geist Mono Variable', ui-monospace, monospace;
+}
+
+:root {
+  color-scheme: dark;
+  --bg: #0b0d14;
+  --surface: rgb(255 255 255 / 0.05);
+  --surface-strong: rgb(255 255 255 / 0.1);
+  --border: rgb(255 255 255 / 0.1);
+  --text: #e8eaf2;
+  --muted: #8a90a6;
+  --accent-a: #2de2c5;
+  --accent-b: #8b5cf6;
+  --danger: #ff6b81;
+  --glow: 0 0 28px rgb(45 226 197 / 0.35);
+  --ease-spring: cubic-bezier(0.2, 0.9, 0.25, 1.2);
+}
+
+:root[data-theme='light'] {
+  color-scheme: light;
+  --bg: #f5f6fa;
+  --surface: rgb(11 13 20 / 0.04);
+  --surface-strong: rgb(11 13 20 / 0.08);
+  --border: rgb(11 13 20 / 0.1);
+  --text: #12141c;
+  --muted: #5b6178;
+  --glow: 0 0 22px rgb(139 92 246 / 0.25);
+}
+
+@media (prefers-color-scheme: light) {
+  :root[data-theme='system'] {
+    color-scheme: light;
+    --bg: #f5f6fa;
+    --surface: rgb(11 13 20 / 0.04);
+    --surface-strong: rgb(11 13 20 / 0.08);
+    --border: rgb(11 13 20 / 0.1);
+    --text: #12141c;
+    --muted: #5b6178;
+    --glow: 0 0 22px rgb(139 92 246 / 0.25);
+  }
+}
+
+html,
+body {
+  margin: 0;
+  background: transparent;
+  color: var(--text);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+:root[data-view='timeline'] body,
+:root[data-view='settings'] body {
+  background: var(--bg);
+}
+
+.glass {
+  background: color-mix(in srgb, var(--bg) 70%, transparent);
+  backdrop-filter: blur(24px) saturate(140%);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+}
+
+.accent-text {
+  background: linear-gradient(120deg, var(--accent-a), var(--accent-b));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.hoverable {
+  transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease, opacity 140ms ease;
+}
+
+.move {
+  transition: transform 420ms var(--ease-spring), opacity 200ms ease;
+}
+
+.pulse {
+  animation: pulse 2.4s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgb(45 226 197 / 0.0); }
+  50% { box-shadow: var(--glow); }
+}
+
+/* Reduced motion keeps short fades and hover transitions; only large movement goes. */
+@media (prefers-reduced-motion: reduce) {
+  .move {
+    transition: opacity 160ms ease;
+    transform: none !important;
+  }
+  .pulse {
+    animation: none;
+    box-shadow: var(--glow);
+  }
+}
