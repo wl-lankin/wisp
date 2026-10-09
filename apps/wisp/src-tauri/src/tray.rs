@@ -18,6 +18,21 @@ fn icon(pending: bool) -> Image<'static> {
     Image::from_bytes(bytes).expect("tray icon is a valid PNG")
 }
 
+fn event_rect(event: &TrayIconEvent) -> Option<windows::Rect> {
+    let rect = match event {
+        TrayIconEvent::Click { rect, .. }
+        | TrayIconEvent::DoubleClick { rect, .. }
+        | TrayIconEvent::Enter { rect, .. }
+        | TrayIconEvent::Move { rect, .. }
+        | TrayIconEvent::Leave { rect, .. } => rect,
+        _ => return None,
+    };
+    // Tray rects are reported in physical pixels, so a scale of 1 leaves them unchanged.
+    let position = rect.position.to_physical::<i32>(1.0);
+    let size = rect.size.to_physical::<u32>(1.0);
+    Some(windows::Rect { x: position.x, y: position.y, width: size.width, height: size.height })
+}
+
 pub fn install(app: &AppHandle) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "Open Wisp", true, None::<&str>)?;
     let timeline = MenuItem::with_id(app, "timeline", "Timeline", true, None::<&str>)?;
@@ -53,7 +68,7 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
-            tauri_plugin_positioner::on_tray_event(tray.app_handle(), &event);
+            windows::set_tray_rect(tray.app_handle(), event_rect(&event));
             if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
                 windows::toggle_panel(tray.app_handle());
             }

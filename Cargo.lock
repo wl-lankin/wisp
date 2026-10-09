@@ -4521,21 +4521,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tauri-plugin-positioner"
-version = "2.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bcad1d07c6cd206c249976c3dbb57eda7f1fc62a25b25099c74345ab2d2e3ef6"
-dependencies = [
- "log",
- "serde",
- "serde_json",
- "serde_repr",
- "tauri",
- "tauri-plugin",
- "thiserror 2.0.21",
-]
-
-[[package]]
 name = "tauri-plugin-single-instance"
 version = "2.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5897,7 +5882,6 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-global-shortcut",
  "tauri-plugin-opener",
- "tauri-plugin-positioner",
  "tauri-plugin-single-instance",
  "tempfile",
  "thiserror 2.0.21",
@@ -5905,6 +5889,7 @@ dependencies = [
  "tracing",
  "uuid",
  "window-vibrancy 0.6.0",
+ "windows-sys 0.61.2",
  "wisp-core",
 ]
 

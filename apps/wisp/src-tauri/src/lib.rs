@@ -8,6 +8,7 @@ mod windows;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use tauri::{AppHandle, Emitter, Manager};
 use wisp_core::engine::Event;
@@ -22,6 +23,10 @@ pub struct AppState {
     pub settings_path: PathBuf,
     /// True while a file drag hovers a Wisp window, so the panel does not hide mid-drag.
     pub dragging: AtomicBool,
+    /// Last known tray icon rect in physical pixels, used to place the panel and toast.
+    pub tray_rect: Mutex<Option<windows::Rect>>,
+    /// When the panel last hid because it lost focus, so the tray click that caused it closes it.
+    pub panel_blurred_at: Mutex<Option<Instant>>,
 }
 
 struct TauriSink {
@@ -62,7 +67,6 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_positioner::init())
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             let default_save_dir = app.path().download_dir()?.join("Wisp");
@@ -75,6 +79,8 @@ pub fn run() {
                 paths: Paths { data_dir, default_save_dir },
                 settings_path,
                 dragging: AtomicBool::new(false),
+                tray_rect: Mutex::new(None),
+                panel_blurred_at: Mutex::new(None),
             });
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
