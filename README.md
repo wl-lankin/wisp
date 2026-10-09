@@ -13,6 +13,7 @@ Share your clipboard and files between Mac and Windows on your local network. Pe
 1. Download the setup from the latest release and run it.
 2. It asks for admin rights once, because Wisp installs for all users on the machine.
 3. The installer adds a firewall rule so your other devices can reach Wisp on private networks.
+4. Make sure your network is set to Private (Settings > Network & internet > your network > Network profile type).
 
 The installer is not signed yet, so SmartScreen may warn you. Choose "More info", then "Run anyway".
 
@@ -29,7 +30,7 @@ The installer is not signed yet, so SmartScreen may warn you. Choose "More info"
 
 ## Everyday use
 
-- **Catch card:** press `Ctrl+Alt+V` on Windows or `Ctrl+Option+V` on macOS to catch what is on your clipboard and send it. You can change the shortcut in Settings.
+- **Catch card:** press `Ctrl+Alt+V` on Windows or `Ctrl+Option+V` on macOS to put the newest item another device offered onto this clipboard. You can change the shortcut in Settings.
 - **Auto-sync:** turn it on per device, so a paired device always gets your clipboard.
 - **Files:** drag files onto a device to send them.
 - **Timeline:** see everything you sent and received in one place.
@@ -63,13 +64,13 @@ cargo test --workspace
 1. In `apps/wisp`, run `npm run set-version 0.2.0`.
 2. At the repo root, run `cargo check` so `Cargo.lock` picks up the new crate versions.
 3. Commit the manifests and `Cargo.lock`.
-4. Tag it with `git tag v0.2.0` and push the tag.
+4. Tag it with `git tag v0.2.0` and push the commit and the tag.
 
 CI builds the Windows setup and the universal dmg into a draft release. Publish it by hand when you are happy.
 
 ## Status
 
-Version 0.1. Builds are unsigned.
+Version 0.1. Builds are not code signed by a trusted certificate.
 
 ## Docs
 

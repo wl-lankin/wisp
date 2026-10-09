@@ -154,5 +154,5 @@ Calm and smooth: spring-based orb movement, soft toast slide-in, glow pulses. Un
 ## 7. Build and distribution
 
 - Windows installer (NSIS) and macOS `.dmg` (universal) built by GitHub Actions on tag push.
-- macOS build is unsigned in v1; first launch needs right-click, Open.
+- macOS build is ad-hoc signed, not notarized, in v1; first launch is allowed via System Settings > Privacy & Security > Open Anyway.
 - Public repository: `wl-lankin/wisp`.
