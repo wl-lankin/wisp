@@ -1,3 +1,6 @@
+mod dto;
+mod settings;
+
 pub fn run() {
     tauri::Builder::default()
         .build(tauri::generate_context!())
