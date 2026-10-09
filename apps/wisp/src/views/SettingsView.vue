@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import PairingCard from './PairingCard.vue'
 import { api } from '../lib/api'
 import { useAppStore } from '../lib/appStore'
 import { comboFromEvent, comboProblem, displayCombo } from '../lib/hotkeys'
@@ -137,7 +138,7 @@ const themes: { id: Theme; name: string }[] = [
 
     <section class="flex flex-col gap-2">
       <h2 class="text-[11px] font-medium uppercase tracking-wider text-[var(--muted)]">Pair a device</h2>
-      <slot name="pairing"><p class="text-[var(--muted)]">Pairing arrives in the next step.</p></slot>
+      <PairingCard />
     </section>
 
     <section class="flex flex-col gap-2">

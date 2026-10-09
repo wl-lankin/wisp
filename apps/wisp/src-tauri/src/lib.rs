@@ -136,7 +136,9 @@ fn adopt_system_autostart(app: &AppHandle) {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            let _ = windows::show(app, windows::View::Panel);
+            let onboarded = app.try_state::<AppState>().is_none_or(|state| state.settings.lock().unwrap().onboarded);
+            let view = if onboarded { windows::View::Panel } else { windows::View::Onboarding };
+            let _ = windows::show(app, view);
         }))
         .plugin(hotkey::plugin())
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
@@ -178,6 +180,7 @@ pub fn run() {
             commands::get_settings,
             commands::update_settings,
             commands::complete_onboarding,
+            commands::default_device_name,
             commands::pick_folder,
             commands::begin_pairing,
             commands::cancel_pairing,

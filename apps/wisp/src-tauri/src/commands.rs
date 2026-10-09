@@ -132,9 +132,12 @@ pub async fn complete_onboarding(app: AppHandle, state: State<'_, AppState>, dev
     if let Err(message) = crate::apply_autostart(&app, saved.autostart) {
         let _ = app.emit("wisp://event", serde_json::json!({ "type": "error", "message": message }));
     }
-    crate::windows::hide(&app, View::Onboarding);
-    let _ = crate::windows::show(&app, View::Panel);
     Ok(())
+}
+
+#[tauri::command]
+pub fn default_device_name() -> String {
+    crate::engine::default_device_name()
 }
 
 #[tauri::command]

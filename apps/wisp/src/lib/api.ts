@@ -9,6 +9,7 @@ export const api = {
   getSettings: () => invoke<AppSettings>('get_settings'),
   updateSettings: (next: AppSettings) => invoke<AppSettings>('update_settings', { next }),
   completeOnboarding: (deviceName: string) => invoke<void>('complete_onboarding', { deviceName }),
+  defaultDeviceName: () => invoke<string>('default_device_name'),
   pickFolder: () => invoke<string | null>('pick_folder'),
   beginPairing: () => invoke<string>('begin_pairing'),
   cancelPairing: () => invoke<void>('cancel_pairing'),
