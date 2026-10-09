@@ -217,11 +217,18 @@ async fn files_arrive_in_the_save_folder() {
     let ids = a.node.send_files(b.node.device_id(), vec![src.path().join("report.pdf")]).await.unwrap();
     assert_eq!(ids.len(), 1);
 
-    let Event::TransferDone { path: Some(path), .. } =
+    let Event::TransferProgress { transfer_id, name, outgoing: false, .. } =
+        wait_for(&mut b.events, "incoming progress", |e| matches!(e, Event::TransferProgress { outgoing: false, .. })).await
+    else {
+        unreachable!()
+    };
+    assert_eq!((transfer_id, name.as_str()), (ids[0], "report.pdf"), "the receiver must use the sender's header");
+    let Event::TransferDone { transfer_id, path: Some(path), .. } =
         wait_for(&mut b.events, "file saved", |e| matches!(e, Event::TransferDone { path: Some(_), .. })).await
     else {
         unreachable!()
     };
+    assert_eq!(transfer_id, ids[0]);
     assert_eq!(path, b.dir.path().join("save").join("report.pdf"));
     assert_eq!(std::fs::read(&path).unwrap().len(), 700_000);
     wait_for(&mut a.events, "sender done", |e| matches!(e, Event::TransferDone { path: None, .. })).await;

@@ -487,6 +487,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_dropped_incoming_transfer_fails_under_the_sender_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, _clip, mut events) = start_node(dir.path()).await;
+        let (peer, transfer_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let (mut sender, receiver) = tokio::io::duplex(64 * 1024);
+        let start = Message::FileStart { transfer_id, name: "big.bin".into(), size: 100, hash: [0; 32] };
+        crate::protocol::write_frame(&mut sender, &start).await.unwrap();
+        let receive = node.inner.receive_on(peer, receiver);
+        let drop_sender = async move {
+            let _ack = crate::protocol::read_frame(&mut sender).await.unwrap();
+            drop(sender);
+        };
+        let (result, ()) = tokio::join!(receive, drop_sender);
+        assert!(result.is_err());
+        let progress = wait_for(&mut events, |e| matches!(e, Event::TransferProgress { .. })).await;
+        assert!(matches!(progress, Event::TransferProgress { transfer_id: id, ref name, done: 0, total: 100, .. }
+            if id == transfer_id && name == "big.bin"));
+        let failed = wait_for(&mut events, |e| matches!(e, Event::TransferFailed { .. })).await;
+        assert!(matches!(failed, Event::TransferFailed { transfer_id: id, peer: p, .. } if id == transfer_id && p == peer));
+    }
+
+    #[tokio::test]
     async fn start_removes_leftover_spills() {
         let dir = tempfile::tempdir().unwrap();
         let tmp = dir.path().join("data").join("tmp");
@@ -549,7 +571,11 @@ mod tests {
         let failed = wait_for(&mut events, |e| matches!(e, Event::TransferFailed { .. })).await;
         let Event::TransferFailed { transfer_id, reason, .. } = failed else { unreachable!() };
         assert_eq!((transfer_id, reason.as_str()), (id, "shut down"));
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The spill is removed right after the event; allow for a busy test runtime.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while spill.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         assert!(!spill.exists());
     }
 

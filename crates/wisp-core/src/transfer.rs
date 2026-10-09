@@ -11,27 +11,27 @@ pub const CHUNK: usize = 256 * 1024;
 pub const RESUME_WINDOW: Duration = Duration::from_secs(600);
 pub const PARTIAL_DIR: &str = ".wisp-partial";
 const MAX_COMPONENT_BYTES: usize = 255;
-const RESERVED:[&str; 22] = [
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+/// Windows device names, matched case-insensitively against the part before the first dot.
+const RESERVED: [&str; 32] = [
+    "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "COM0", "COM1", "COM2", "COM3", "COM4", "COM5",
+    "COM6", "COM7", "COM8", "COM9", "COM\u{00b9}", "COM\u{00b2}", "COM\u{00b3}", "LPT0", "LPT1", "LPT2",
+    "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "LPT\u{00b9}", "LPT\u{00b2}", "LPT\u{00b3}",
 ];
+
+fn is_reserved(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or("").trim_end().to_uppercase();
+    RESERVED.contains(&stem.as_str())
+}
 
 fn sanitize_component(c: &str) -> Option<String> {
     let cleaned: String = c
         .chars()
         .filter(|ch| !ch.is_control() && !"<>:\"|?*".contains(*ch))
         .collect();
-    let trimmed = cleaned.trim_matches(|ch: char| ch == '.' || ch == ' ').to_string();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let stem = trimmed.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
-    let trimmed = truncate_component(&trimmed);
-    let safe = if RESERVED.contains(&stem.as_str()) {
-        truncate_component(&format!("_{trimmed}"))
-    } else {
-        trimmed
-    };
+    let trimmed = cleaned.trim_matches(|ch: char| ch == '.' || ch == ' ');
+    // Truncation can expose a device name ("NUL" + spaces + "x"), so check what is kept.
+    let kept = truncate_component(trimmed);
+    let safe = if is_reserved(&kept) { truncate_component(&format!("_{kept}")) } else { kept };
     if safe.is_empty() {
         None
     } else {
@@ -42,11 +42,7 @@ fn sanitize_component(c: &str) -> Option<String> {
 /// Cuts a name to at most 255 UTF-8 bytes on a char boundary, then drops trailing
 /// dots and spaces again because Windows strips them.
 fn truncate_component(name: &str) -> String {
-    let mut end = name.len().min(MAX_COMPONENT_BYTES);
-    while !name.is_char_boundary(end) {
-        end -= 1;
-    }
-    name[..end].trim_end_matches(['.', ' ']).to_string()
+    cut_to(name, MAX_COMPONENT_BYTES).trim_end_matches(['.', ' ']).to_string()
 }
 
 pub fn sanitize_relative_path(name: &str) -> PathBuf {
@@ -61,12 +57,26 @@ pub fn sanitize_relative_path(name: &str) -> PathBuf {
     parts.iter().collect()
 }
 
+fn cut_to(s: &str, max: usize) -> &str {
+    let mut end = s.len().min(max);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// `stem (n).ext`, with the stem shortened so the whole name stays within 255 bytes.
 fn numbered_candidate(path: &Path, stem: &str, ext: Option<&str>, n: u32) -> PathBuf {
-    let name = match ext {
-        Some(ext) => format!("{stem} ({n}).{ext}"),
-        None => format!("{stem} ({n})"),
+    let suffix = format!(" ({n})");
+    let ext = ext.map(|e| format!(".{e}")).unwrap_or_default();
+    // An extension too long to keep next to the suffix is cut along with the stem.
+    let (stem, ext) = if ext.len() + suffix.len() < MAX_COMPONENT_BYTES {
+        (stem.to_string(), ext)
+    } else {
+        (format!("{stem}{ext}"), String::new())
     };
-    path.with_file_name(name)
+    let room = MAX_COMPONENT_BYTES - suffix.len() - ext.len();
+    path.with_file_name(format!("{}{suffix}{ext}", cut_to(&stem, room)))
 }
 
 /// Atomically claims a free file name by creating an empty placeholder with
@@ -176,15 +186,26 @@ pub async fn send_file<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
+/// What the sender announced in `FileStart`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileHeader {
+    pub transfer_id: Uuid,
+    pub name: String,
+    pub size: u64,
+}
+
+/// Receives one file into `save_dir`. `progress` gets the sender's header with every call;
+/// the first call comes right after the header was accepted, with the resume offset.
 pub async fn receive_file<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     save_dir: &Path,
-    progress: &mut (dyn FnMut(u64, u64) + Send),
+    progress: &mut (dyn FnMut(&FileHeader, u64) + Send),
 ) -> Result<PathBuf> {
     let (transfer_id, name, size, hash) = match read_frame(stream).await? {
         Message::FileStart { transfer_id, name, size, hash } => (transfer_id, name, size, hash),
         other => return Err(CoreError::Transfer(format!("expected FileStart, got {other:?}"))),
     };
+    let header = FileHeader { transfer_id, name, size };
     let partial_dir = save_dir.join(PARTIAL_DIR);
     tokio::fs::create_dir_all(&partial_dir).await?;
     let partial = partial_dir.join(format!("{transfer_id}.part"));
@@ -197,6 +218,7 @@ pub async fn receive_file<S: AsyncRead + AsyncWrite + Unpin>(
     file.set_len(offset).await?;
     file.seek(std::io::SeekFrom::Start(offset)).await?;
     write_frame(stream, &Message::FileAck { transfer_id, offset }).await?;
+    progress(&header, offset);
 
     let mut oversized = false;
     loop {
@@ -216,7 +238,7 @@ pub async fn receive_file<S: AsyncRead + AsyncWrite + Unpin>(
                 // bytes are handed to the OS before a dropped connection aborts this loop.
                 file.flush().await?;
                 offset = end;
-                progress(offset, size);
+                progress(&header, offset);
             }
             Message::FileDone { .. } => break,
             other => return Err(CoreError::Transfer(format!("unexpected message {other:?}"))),
@@ -235,7 +257,7 @@ pub async fn receive_file<S: AsyncRead + AsyncWrite + Unpin>(
         write_frame(stream, &Message::FileAck { transfer_id, offset: 0 }).await?;
         return Err(CoreError::Transfer("checksum mismatch".into()));
     }
-    let wanted = save_dir.join(sanitize_relative_path(&name));
+    let wanted = save_dir.join(sanitize_relative_path(&header.name));
     if let Some(parent) = wanted.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -453,6 +475,65 @@ mod tests {
         assert_eq!(std::fs::read(dst.path().join("shot.png")).unwrap(), b"existing");
         assert_eq!(std::fs::read(&p1).unwrap(), std::fs::read(&file_a).unwrap());
         assert_eq!(std::fs::read(&p2).unwrap(), std::fs::read(&file_b).unwrap());
+    }
+
+    #[test]
+    fn reserved_names_are_checked_after_truncation() {
+        let name = format!("NUL{}x", " ".repeat(300));
+        assert_eq!(sanitize_relative_path(&name), PathBuf::from("_NUL"));
+        let name = format!("con{}.txt", " ".repeat(300));
+        assert_eq!(sanitize_relative_path(&name), PathBuf::from("_con"));
+    }
+
+    #[test]
+    fn extended_reserved_device_names_are_prefixed() {
+        for name in ["COM0", "lpt0.txt", "COM\u{00b9}", "com\u{00b2}.log", "LPT\u{00b3}", "CONIN$", "conout$.txt"] {
+            let rel = sanitize_relative_path(name);
+            assert_eq!(rel, PathBuf::from(format!("_{name}")), "{name:?} became {rel:?}");
+        }
+        assert_eq!(sanitize_relative_path("COM10.txt"), PathBuf::from("COM10.txt"));
+    }
+
+    #[test]
+    fn numbered_candidates_of_long_names_stay_within_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = format!("{}.txt", "a".repeat(251));
+        assert_eq!(long.len(), 255);
+        let first = dir.path().join(&long);
+        std::fs::write(&first, b"x").unwrap();
+        let next = unique_path(&first);
+        let shown = next.file_name().unwrap().to_str().unwrap();
+        assert!(shown.len() <= 255, "{} bytes", shown.len());
+        assert!(shown.ends_with(" (1).txt"), "{shown}");
+
+        let multibyte = "\u{00e4}".repeat(127);
+        let candidate = numbered_candidate(&dir.path().join(&multibyte), &multibyte, None, 12);
+        let shown = candidate.file_name().unwrap().to_str().unwrap();
+        assert!(shown.len() <= 255 && shown.ends_with(" (12)"), "{shown}");
+
+        let ext = "b".repeat(253);
+        let candidate = numbered_candidate(&dir.path().join(format!("a.{ext}")), "a", Some(&ext), 3);
+        assert!(candidate.file_name().unwrap().len() <= 255);
+    }
+
+    #[tokio::test]
+    async fn the_receiver_learns_the_sender_header_first() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let file = write_file(src.path(), "notes.txt", 10);
+        let (mut a, mut b) = tokio::io::duplex(1024 * 1024);
+        let dst_path = dst.path().to_path_buf();
+        let recv = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            receive_file(&mut b, &dst_path, &mut |h: &FileHeader, done| seen.push((h.clone(), done))).await.unwrap();
+            seen
+        });
+        let id = Uuid::new_v4();
+        send_file(&mut a, id, &file, "notes.txt", &mut |_| {}).await.unwrap();
+        let seen = recv.await.unwrap();
+        let header = FileHeader { transfer_id: id, name: "notes.txt".into(), size: 10 };
+        assert_eq!(seen.first(), Some(&(header.clone(), 0)));
+        assert_eq!(seen.last(), Some(&(header, 10)));
     }
 
     #[test]
