@@ -1,6 +1,7 @@
 mod commands;
 mod dto;
 mod engine;
+mod hotkey;
 mod settings;
 mod tray;
 mod windows;
@@ -63,8 +64,41 @@ pub(crate) async fn start_engine(app: &AppHandle) {
     }
 }
 
+pub(crate) async fn catch_from_hotkey(app: &AppHandle) {
+    let Ok(node) = app.state::<AppState>().engine.node().await else { return };
+    match node.catch_latest().await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            let _ = windows::show(app, windows::View::Panel);
+        }
+        Err(e) => {
+            let _ = app.emit("wisp://event", serde_json::json!({ "type": "error", "message": e.to_string() }));
+        }
+    }
+    tray::refresh(app).await;
+}
+
+pub(crate) fn sync_system_integration(app: &AppHandle, settings: &AppSettings) {
+    use tauri_plugin_autostart::ManagerExt;
+    if let Err(message) = hotkey::apply(app, None, &settings.hotkey) {
+        let _ = app.emit("wisp://event", serde_json::json!({ "type": "error", "message": format!("{message}. Change it in Settings.") }));
+    }
+    let launcher = app.autolaunch();
+    let enabled = launcher.is_enabled().unwrap_or(false);
+    if settings.autostart && !enabled {
+        let _ = launcher.enable();
+    } else if !settings.autostart && enabled {
+        let _ = launcher.disable();
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            let _ = windows::show(app, windows::View::Panel);
+        }))
+        .plugin(hotkey::plugin())
+        .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
@@ -73,6 +107,7 @@ pub fn run() {
             let settings_path = data_dir.join("settings.json");
             let settings = AppSettings::load(&settings_path);
             let onboarded = settings.onboarded;
+            let startup_settings = settings.clone();
             app.manage(AppState {
                 engine: Engine::default(),
                 settings: Mutex::new(settings),
@@ -86,6 +121,7 @@ pub fn run() {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             tray::install(app.handle())?;
             if onboarded {
+                sync_system_integration(app.handle(), &startup_settings);
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move { start_engine(&handle).await });
             } else {

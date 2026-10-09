@@ -67,6 +67,7 @@ fn save_settings(app: &AppHandle, state: &AppState, next: AppSettings) -> Cmd<Ap
 
 #[tauri::command]
 pub async fn update_settings(app: AppHandle, state: State<'_, AppState>, mut next: AppSettings) -> Cmd<AppSettings> {
+    use tauri_plugin_autostart::ManagerExt;
     if let Some(name) = next.device_name.take() {
         let name = name.trim();
         if name.is_empty() {
@@ -75,6 +76,14 @@ pub async fn update_settings(app: AppHandle, state: State<'_, AppState>, mut nex
         next.device_name = Some(name.chars().take(64).collect());
     }
     let previous = state.settings.lock().unwrap().clone();
+    if next.hotkey != previous.hotkey {
+        crate::hotkey::apply(&app, Some(&previous.hotkey), &next.hotkey)?;
+    }
+    if next.autostart != previous.autostart {
+        let launcher = app.autolaunch();
+        let result = if next.autostart { launcher.enable() } else { launcher.disable() };
+        result.map_err(|e| format!("Could not change start at login ({e})"))?;
+    }
     let saved = save_settings(&app, &state, next)?;
     if saved.onboarded && saved.save_dir != previous.save_dir {
         crate::start_engine(&app).await;
@@ -91,8 +100,9 @@ pub async fn complete_onboarding(app: AppHandle, state: State<'_, AppState>, dev
     let mut next = state.settings.lock().unwrap().clone();
     next.device_name = Some(name.chars().take(64).collect());
     next.onboarded = true;
-    save_settings(&app, &state, next)?;
+    let saved = save_settings(&app, &state, next)?;
     crate::start_engine(&app).await;
+    crate::sync_system_integration(&app, &saved);
     crate::windows::hide(&app, View::Onboarding);
     let _ = crate::windows::show(&app, View::Panel);
     Ok(())
