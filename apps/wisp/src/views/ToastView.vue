@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import IconGlyph from '../components/IconGlyph.vue'
 import PreviewBody from '../components/PreviewBody.vue'
 import { api } from '../lib/api'
@@ -9,8 +9,9 @@ import { pushNotice } from '../lib/store'
 import { groupOffers, shouldHide } from '../lib/toasts'
 
 const { state, settings } = useAppStore()
-const root = ref<HTMLElement | null>(null)
+const content = ref<HTMLElement | null>(null)
 const hovering = ref(false)
+const hidden = ref(false)
 const lastChange = ref(Date.now())
 const working = ref<string | null>(null)
 
@@ -24,17 +25,34 @@ const groups = computed(() =>
   groupOffers(state.inbox, (id) => state.peers.find((p) => p.peer.deviceId === id)?.peer.name ?? 'A device'),
 )
 
+const FADE_MS = 200
+let fadeTimer: ReturnType<typeof setTimeout> | undefined
+let lastHeight = 0
+
 watch(
   () => state.inbox.map((o) => o.itemId).join(','),
-  async () => {
+  () => {
+    hovering.value = false
     lastChange.value = Date.now()
-    await nextTick()
-    report()
+    if (state.inbox.length > 0) {
+      clearTimeout(fadeTimer)
+      hidden.value = false
+    }
   },
 )
 
 function report() {
-  if (root.value) void api.fitToast(root.value.getBoundingClientRect().height + 8)
+  if (!content.value) return
+  const height = Math.ceil(content.value.getBoundingClientRect().height) + 8
+  if (height === lastHeight) return
+  lastHeight = height
+  void api.fitToast(height)
+}
+
+function hideSelf() {
+  hovering.value = false
+  hidden.value = true
+  fadeTimer = setTimeout(() => void api.hideWindow('toast'), FADE_MS)
 }
 
 function leave() {
@@ -61,25 +79,51 @@ async function run(itemId: string, action: keyof typeof tasks) {
 }
 
 let timer: ReturnType<typeof setInterval> | undefined
+let observer: ResizeObserver | undefined
+
+function releaseHover() {
+  hovering.value = false
+}
+function onVisibility() {
+  if (document.visibilityState !== 'visible') releaseHover()
+}
+
 onMounted(() => {
+  if (content.value) {
+    observer = new ResizeObserver(report)
+    observer.observe(content.value)
+  }
   report()
+  window.addEventListener('blur', releaseHover)
+  document.addEventListener('visibilitychange', onVisibility)
   timer = setInterval(() => {
-    if (state.ready && shouldHide(Date.now(), lastChange.value, hovering.value, state.inbox.length)) {
-      void api.hideWindow('toast')
+    if (state.ready && !hidden.value && shouldHide(Date.now(), lastChange.value, hovering.value, state.inbox.length)) {
+      hideSelf()
     }
   }, 500)
 })
-onUnmounted(() => clearInterval(timer))
+onUnmounted(() => {
+  clearInterval(timer)
+  clearTimeout(fadeTimer)
+  observer?.disconnect()
+  window.removeEventListener('blur', releaseHover)
+  document.removeEventListener('visibilitychange', onVisibility)
+})
 </script>
 
 <template>
   <div
-    ref="root"
-    class="flex flex-col gap-2 p-1"
-    :class="isMac ? '' : 'justify-end'"
-    @mouseenter="hovering = true"
-    @mouseleave="leave"
+    class="flex min-h-screen flex-col transition-opacity duration-200"
+    :class="isMac ? 'justify-start' : 'justify-end'"
+    :style="{ opacity: hidden ? 0 : 1 }"
   >
+    <div
+      ref="content"
+      data-testid="toast-content"
+      class="flex flex-col gap-2 p-1"
+      @mouseenter="hovering = true"
+      @mouseleave="leave"
+    >
     <TransitionGroup name="toast">
       <article v-for="g in groups" :key="g.peer" class="glass p-3 shadow-2xl">
         <header class="mb-2 flex items-center justify-between text-[11px]">
@@ -119,6 +163,7 @@ onUnmounted(() => clearInterval(timer))
         </footer>
       </article>
     </TransitionGroup>
+    </div>
   </div>
 </template>
 
