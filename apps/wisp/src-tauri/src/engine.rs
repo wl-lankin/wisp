@@ -8,6 +8,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, Mutex};
 use wisp_core::clipboard::{ClipboardBackend, SystemClipboard};
 use wisp_core::engine::{Event, Node, NodeConfig};
+use wisp_core::history::HISTORY_CAP;
 use wisp_core::CoreError;
 
 use crate::dto::event_to_ui;
@@ -59,6 +60,7 @@ pub fn node_config(
         clipboard,
         clipboard_poll: Duration::from_millis(250),
         dial_interval: Duration::from_secs(5),
+        history_cap: HISTORY_CAP,
     }
 }
 

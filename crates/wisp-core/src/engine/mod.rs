@@ -36,6 +36,7 @@ pub struct NodeConfig {
     pub clipboard: Arc<dyn ClipboardBackend>,
     pub clipboard_poll: Duration,
     pub dial_interval: Duration,
+    pub history_cap: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -153,7 +154,8 @@ impl Node {
         let identity_path = cfg.data_dir.join("identity.json");
         let identity = Identity::load_or_create(&identity_path, &cfg.device_name)?;
         let peers = PeerStore::open(&cfg.data_dir.join("peers.json"))?;
-        let history = History::open(&cfg.data_dir.join("history"))?;
+        let mut history = History::open(&cfg.data_dir.join("history"))?;
+        history.set_cap(cfg.history_cap)?;
         std::fs::create_dir_all(&cfg.save_dir)?;
         // tmp only holds clipboard spills of a previous run, which may carry secrets.
         let tmp_dir = cfg.data_dir.join("tmp");
@@ -317,6 +319,14 @@ impl Node {
         self.inner.history.lock().unwrap().query(q)
     }
 
+    pub fn set_history_cap(&self, cap: usize) -> Result<()> {
+        self.inner.history.lock().unwrap().set_cap(cap)
+    }
+
+    pub fn history_count(&self) -> Result<usize> {
+        self.inner.history.lock().unwrap().count()
+    }
+
     /// Puts a timeline item back on this device's clipboard without re-offering it.
     pub async fn copy_from_history(&self, id: Uuid) -> Result<()> {
         let item = self.inner.history.lock().unwrap().load(id)?;
@@ -426,6 +436,7 @@ mod tests {
             clipboard: clip.clone(),
             clipboard_poll: Duration::from_millis(20),
             dial_interval: Duration::from_millis(200),
+            history_cap: crate::history::HISTORY_CAP,
         };
         let (node, events) = Node::start(cfg).await.unwrap();
         (node, clip, events)
@@ -702,9 +713,19 @@ mod tests {
             clipboard: Arc::new(MemoryClipboard::new()),
             clipboard_poll: Duration::from_millis(20),
             dial_interval: Duration::from_millis(200),
+            history_cap: crate::history::HISTORY_CAP,
         };
         assert!(Node::start(cfg).await.is_err());
         std::net::UdpSocket::bind(("127.0.0.1", port)).expect("the failed start kept the port bound");
+    }
+
+    #[tokio::test]
+    async fn history_cap_can_change_at_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, _clip) = node(dir.path()).await;
+        assert_eq!(node.history_count().unwrap(), 0);
+        assert!(node.set_history_cap(5).is_err());
+        assert!(node.set_history_cap(50).is_ok());
     }
 
     #[tokio::test]

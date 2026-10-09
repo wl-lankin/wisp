@@ -46,6 +46,7 @@ fn config(dir: &Path, name: &str, clip: Arc<dyn ClipboardBackend>) -> NodeConfig
         clipboard: clip,
         clipboard_poll: Duration::from_millis(20),
         dial_interval: Duration::from_millis(200),
+        history_cap: wisp_core::history::HISTORY_CAP,
     }
 }
 
