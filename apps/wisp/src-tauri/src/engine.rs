@@ -8,6 +8,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, Mutex};
 use wisp_core::clipboard::{ClipboardBackend, SystemClipboard};
 use wisp_core::engine::{Event, Node, NodeConfig};
+use wisp_core::history::{MAX_HISTORY, MIN_HISTORY};
 use wisp_core::CoreError;
 
 use crate::dto::event_to_ui;
@@ -59,6 +60,7 @@ pub fn node_config(
         clipboard,
         clipboard_poll: Duration::from_millis(250),
         dial_interval: Duration::from_secs(5),
+        history_cap: (settings.history_size as usize).clamp(MIN_HISTORY, MAX_HISTORY),
     }
 }
 
@@ -242,6 +244,13 @@ mod tests {
         let cfg = node_config(&custom, &paths, clip, 0);
         assert_eq!(cfg.device_name, "Laptop");
         assert_eq!(cfg.save_dir, PathBuf::from("/elsewhere"));
+        assert_eq!(defaults.history_cap, 200);
+        let big = AppSettings { history_size: 1000, ..AppSettings::default() };
+        assert_eq!(node_config(&big, &paths, Arc::new(MemoryClipboard::new()), 0).history_cap, 1000);
+        let wild = AppSettings { history_size: 0, ..AppSettings::default() };
+        assert_eq!(node_config(&wild, &paths, Arc::new(MemoryClipboard::new()), 0).history_cap, MIN_HISTORY);
+        let huge = AppSettings { history_size: u32::MAX, ..AppSettings::default() };
+        assert_eq!(node_config(&huge, &paths, Arc::new(MemoryClipboard::new()), 0).history_cap, MAX_HISTORY);
     }
 
     struct Recorder {

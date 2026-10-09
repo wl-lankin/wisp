@@ -15,6 +15,9 @@ const PANEL_MARGIN: f64 = 8.0;
 const TOAST_WIDTH: f64 = 360.0;
 /// A tray click right after the panel hid on blur is the click that blurred it, so it closes the panel.
 const BLUR_CLICK_WINDOW: Duration = Duration::from_millis(300);
+/// Right after a tray click Windows can hand focus back to the taskbar, so a blur this soon after
+/// showing the panel is not the user leaving it.
+const SHOW_SETTLE: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
@@ -126,9 +129,21 @@ fn builder<'a>(app: &'a AppHandle, view: View) -> WebviewWindowBuilder<'a, tauri
             .resizable(false)
             .skip_taskbar(true)
             .center(),
-        View::Timeline => b.title("Wisp timeline").inner_size(1040.0, 720.0).min_inner_size(640.0, 480.0).center(),
-        View::Settings => b.title("Wisp settings").inner_size(560.0, 640.0).resizable(false).center(),
+        View::Timeline => frameless(b.title("Wisp timeline").inner_size(1040.0, 720.0).min_inner_size(640.0, 480.0).center()),
+        View::Settings => frameless(b.title("Wisp settings").inner_size(560.0, 640.0).resizable(false).center()),
     }
+}
+
+/// No title bar: the page draws its own drag strip. Windows keeps the system frame, shadow and resize
+/// edges; macOS keeps its traffic lights floating over the content.
+fn frameless<'a>(
+    b: WebviewWindowBuilder<'a, tauri::Wry, AppHandle>,
+) -> WebviewWindowBuilder<'a, tauri::Wry, AppHandle> {
+    #[cfg(target_os = "macos")]
+    let b = b.title_bar_style(tauri::TitleBarStyle::Overlay).hidden_title(true);
+    #[cfg(not(target_os = "macos"))]
+    let b = b.decorations(false);
+    b
 }
 
 fn apply_material(window: &WebviewWindow, view: View) {
@@ -249,8 +264,29 @@ fn hide_after_release(app: AppHandle) {
     });
 }
 
+/// Whether the panel was shown so recently that a blur means the system took focus, not the user.
+fn settling(shown_at: Option<Instant>, now: Instant) -> bool {
+    shown_at.is_some_and(|at| now.saturating_duration_since(at) < SHOW_SETTLE)
+}
+
+fn refocus_panel(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if let Some(w) = app.get_webview_window(View::Panel.label()) {
+            if w.is_visible().unwrap_or(false) {
+                let _ = w.set_focus();
+            }
+        }
+    });
+}
+
 fn on_panel_blur(app: &AppHandle) {
     if app.state::<AppState>().dragging.load(Ordering::SeqCst) {
+        return;
+    }
+    if settling(*app.state::<AppState>().panel_shown_at.lock().unwrap(), Instant::now()) {
+        refocus_panel(app);
         return;
     }
     #[cfg(target_os = "windows")]
@@ -308,7 +344,9 @@ pub fn show(app: &AppHandle, view: View) -> tauri::Result<WebviewWindow> {
         }
     };
     if view == View::Panel {
-        app.state::<AppState>().dragging.store(false, Ordering::SeqCst);
+        let state = app.state::<AppState>();
+        state.dragging.store(false, Ordering::SeqCst);
+        *state.panel_shown_at.lock().unwrap() = Some(Instant::now());
     }
     place(&window, view);
     window.show()?;
@@ -386,6 +424,14 @@ mod tests {
             assert_eq!(v.url(), format!("index.html?view={}", v.label()));
         }
         assert_eq!(View::from_label("nope"), None);
+    }
+
+    #[test]
+    fn a_blur_right_after_showing_the_panel_is_ignored() {
+        let shown = Instant::now();
+        assert!(settling(Some(shown), shown + Duration::from_millis(100)));
+        assert!(!settling(Some(shown), shown + SHOW_SETTLE));
+        assert!(!settling(None, shown));
     }
 
     #[test]

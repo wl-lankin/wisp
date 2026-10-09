@@ -46,6 +46,7 @@ fn config(dir: &Path, name: &str, clip: Arc<dyn ClipboardBackend>) -> NodeConfig
         clipboard: clip,
         clipboard_poll: Duration::from_millis(20),
         dial_interval: Duration::from_millis(200),
+        history_cap: wisp_core::history::HISTORY_CAP,
     }
 }
 
@@ -374,4 +375,31 @@ async fn timeline_items_export_to_files() {
     assert_eq!(first.extension().unwrap(), "txt");
     assert!(first.starts_with(out.path()));
     assert!(a.node.export_item(uuid::Uuid::new_v4(), out.path()).await.is_err());
+}
+
+#[tokio::test]
+async fn renaming_reaches_connected_peers_and_persists() {
+    let (a, mut b) = paired().await;
+    let a_id = a.node.device_id();
+    let stored = a.node.rename("  Studio Mac  ").await.unwrap();
+    assert_eq!(stored, "Studio Mac");
+    assert_eq!(a.node.device_name(), "Studio Mac");
+    assert_eq!(a.node.device_id(), a_id);
+    wait_for(&mut b.events, "b sees the rename", |e| {
+        matches!(e, Event::PeerRenamed { peer, name } if *peer == a_id && name == "Studio Mac")
+    })
+    .await;
+    assert!(b.node.peers().iter().any(|p| p.peer.device_id == a_id && p.peer.name == "Studio Mac"));
+    let text = std::fs::read_to_string(a.dir.path().join("data").join("identity.json")).unwrap();
+    assert!(text.contains("Studio Mac"));
+    assert!(matches!(a.node.rename("   ").await, Err(wisp_core::CoreError::Invalid(_))));
+}
+
+#[tokio::test]
+async fn offer_local_reaches_peers_without_touching_the_clipboard() {
+    let (a, mut b) = paired().await;
+    a.node.offer_local(ClipPayload::Text("from a screenshot".into())).await;
+    wait_for(&mut b.events, "offer", |e| matches!(e, Event::OfferReceived(_))).await;
+    assert_eq!(a.clip.current(), None);
+    assert_eq!(a.node.history(&HistoryQuery::default()).unwrap().len(), 1);
 }

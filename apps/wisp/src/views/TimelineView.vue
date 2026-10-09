@@ -2,6 +2,7 @@
 import { computed, onUnmounted, reactive, ref, watch } from 'vue'
 import ItemCard from '../components/ItemCard.vue'
 import SearchField from '../components/SearchField.vue'
+import WindowBar from '../components/WindowBar.vue'
 import { api } from '../lib/api'
 import { useAppStore } from '../lib/appStore'
 import { formatAge, formatBytes } from '../lib/format'
@@ -82,9 +83,10 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <main class="flex h-screen flex-col gap-4 p-6">
-    <header class="flex flex-wrap items-center gap-4">
-      <h1 class="accent-text text-xl font-semibold tracking-tight">Timeline</h1>
+  <main class="flex h-screen flex-col gap-4 px-6 pb-6 pt-12">
+    <WindowBar maximizable />
+    <header data-tauri-drag-region class="flex flex-wrap items-center gap-4">
+      <h1 data-tauri-drag-region class="accent-text text-xl font-semibold tracking-tight">Timeline</h1>
       <div class="w-80"><SearchField v-model="filters.text" placeholder="Search everything you copied" /></div>
       <span class="text-[12px] text-[var(--muted)]">{{ status }}</span>
     </header>

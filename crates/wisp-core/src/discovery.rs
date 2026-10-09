@@ -92,7 +92,7 @@ impl DiscoveredSet {
         Self::default()
     }
 
-    /// Returns whether the device or one of its addresses is new. Addresses are capped at
+    /// Returns whether the device, its name or one of its addresses is new. Addresses are capped at
     /// `MAX_ADDRESSES` with the latest advert first, so spoofed adverts cannot grow the dial
     /// fan-out without bound.
     pub fn merge(&mut self, mut d: Discovered) -> bool {
@@ -103,8 +103,9 @@ impl DiscoveredSet {
                 true
             }
             Some(existing) => {
+                let renamed = existing.name != d.name;
                 existing.name = d.name;
-                let changed = d.addresses.iter().any(|a| !existing.addresses.contains(a));
+                let changed = renamed || d.addresses.iter().any(|a| !existing.addresses.contains(a));
                 let older: Vec<SocketAddr> =
                     existing.addresses.iter().copied().filter(|a| !d.addresses.contains(a)).collect();
                 let mut addresses = d.addresses;
@@ -133,14 +134,22 @@ pub struct Discovery {
     daemon: ServiceDaemon,
 }
 
+fn mdns_err(e: mdns_sd::Error) -> CoreError {
+    CoreError::Transport(format!("mdns: {e}"))
+}
+
+fn service_info(advert: &Advert) -> std::result::Result<ServiceInfo, mdns_sd::Error> {
+    let instance = advert.device_id.to_string();
+    let host = format!("{instance}.local.");
+    ServiceInfo::new(SERVICE_TYPE, &instance, &host, "", advert.port, txt_properties(advert))
+        .map(ServiceInfo::enable_addr_auto)
+}
+
 impl Discovery {
     pub fn start(advert: &Advert) -> Result<(Self, mpsc::UnboundedReceiver<DiscoveryEvent>)> {
-        let mdns_err = |e: mdns_sd::Error| CoreError::Transport(format!("mdns: {e}"));
         let daemon = ServiceDaemon::new().map_err(mdns_err)?;
-        let instance = advert.device_id.to_string();
-        let host = format!("{instance}.local.");
-        let registered = ServiceInfo::new(SERVICE_TYPE, &instance, &host, "", advert.port, txt_properties(advert))
-            .and_then(|info| daemon.register(info.enable_addr_auto()))
+        let registered = service_info(advert)
+            .and_then(|info| daemon.register(info))
             .and_then(|()| daemon.browse(SERVICE_TYPE));
         let browse = match registered {
             Ok(browse) => browse,
@@ -182,6 +191,14 @@ impl Discovery {
             }
         });
         Ok((Self { daemon }, rx))
+    }
+
+    /// Re-announces this device with new details (for example a new name).
+    pub fn update(&self, advert: &Advert) -> Result<()> {
+        let info = service_info(advert).map_err(mdns_err)?;
+        // Registering the same instance again overwrites it and announces the new record.
+        // Unregistering first would send goodbye packets that make peers drop the device.
+        self.daemon.register(info).map_err(mdns_err)
     }
 
     pub fn stop(self) {
@@ -264,6 +281,17 @@ mod tests {
         assert_eq!(set.get(a.device_id).unwrap().addresses.len(), 2);
         set.remove(a.device_id);
         assert!(set.all().is_empty());
+    }
+
+    #[test]
+    fn a_renamed_device_counts_as_a_change() {
+        let a = advert();
+        let first = parse_txt(&txt_properties(&a), &["192.168.1.20".parse().unwrap()], a.port).unwrap();
+        let mut set = DiscoveredSet::new();
+        assert!(set.merge(first.clone()));
+        assert!(!set.merge(first.clone()));
+        assert!(set.merge(Discovered { name: "Renamed".into(), ..first }));
+        assert_eq!(set.get(a.device_id).unwrap().name, "Renamed");
     }
 
     #[test]

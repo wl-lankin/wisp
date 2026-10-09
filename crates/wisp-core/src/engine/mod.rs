@@ -17,7 +17,7 @@ use crate::clipboard::{write_and_mark, ClipboardBackend, EchoGuard};
 use crate::discovery::{DiscoveredSet, Discovery};
 use crate::fsutil::create_private_dir;
 use crate::history::{History, HistoryEntry, HistoryQuery};
-use crate::identity::{Identity, Os};
+use crate::identity::{cap_device_name, Identity, Os};
 use crate::item::{ClipItem, ClipPayload, ItemKind, Preview};
 use crate::pairing::PairingSession;
 use crate::peers::{DeliveryMode, Peer, PeerStore};
@@ -36,6 +36,7 @@ pub struct NodeConfig {
     pub clipboard: Arc<dyn ClipboardBackend>,
     pub clipboard_poll: Duration,
     pub dial_interval: Duration,
+    pub history_cap: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -84,6 +85,7 @@ pub struct NearbyDevice {
 pub enum Event {
     PeerOnline { peer: Uuid, name: String, addr: SocketAddr },
     PeerOffline { peer: Uuid },
+    PeerRenamed { peer: Uuid, name: String },
     Discovered { device: Uuid, name: String, os: Os, addresses: Vec<SocketAddr> },
     IdentityChanged { peer: Uuid },
     Paired { peer: Uuid, name: String },
@@ -111,6 +113,11 @@ struct Conn {
 
 struct Inner {
     identity: Identity,
+    /// The current device name; `identity.name` is only the name from start-up.
+    name: Mutex<String>,
+    identity_path: PathBuf,
+    /// Serializes renames so disk, memory and the announced name stay in step.
+    rename_lock: tokio::sync::Mutex<()>,
     transport: Transport,
     clipboard: Arc<dyn ClipboardBackend>,
     events: mpsc::UnboundedSender<Event>,
@@ -144,9 +151,11 @@ pub struct Node {
 
 impl Node {
     pub async fn start(cfg: NodeConfig) -> Result<(Node, mpsc::UnboundedReceiver<Event>)> {
-        let identity = Identity::load_or_create(&cfg.data_dir.join("identity.json"), &cfg.device_name)?;
+        let identity_path = cfg.data_dir.join("identity.json");
+        let identity = Identity::load_or_create(&identity_path, &cfg.device_name)?;
         let peers = PeerStore::open(&cfg.data_dir.join("peers.json"))?;
-        let history = History::open(&cfg.data_dir.join("history"))?;
+        let mut history = History::open(&cfg.data_dir.join("history"))?;
+        history.set_cap(cfg.history_cap)?;
         std::fs::create_dir_all(&cfg.save_dir)?;
         // tmp only holds clipboard spills of a previous run, which may carry secrets.
         let tmp_dir = cfg.data_dir.join("tmp");
@@ -164,6 +173,9 @@ impl Node {
         let (events, rx) = mpsc::unbounded_channel();
         let (shutdown, _) = watch::channel(false);
         let inner = Arc::new(Inner {
+            name: Mutex::new(cap_device_name(&identity.name)),
+            identity_path,
+            rename_lock: tokio::sync::Mutex::new(()),
             identity,
             transport,
             clipboard: cfg.clipboard,
@@ -206,7 +218,12 @@ impl Node {
     }
 
     pub fn device_name(&self) -> String {
-        self.inner.identity.name.clone()
+        self.inner.current_name()
+    }
+
+    /// Renames this device: persisted, re-advertised and sent to connected peers.
+    pub async fn rename(&self, name: &str) -> Result<String> {
+        self.inner.rename(name).await
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
@@ -302,6 +319,14 @@ impl Node {
         self.inner.history.lock().unwrap().query(q)
     }
 
+    pub fn set_history_cap(&self, cap: usize) -> Result<()> {
+        self.inner.history.lock().unwrap().set_cap(cap)
+    }
+
+    pub fn history_count(&self) -> Result<usize> {
+        self.inner.history.lock().unwrap().count()
+    }
+
     /// Puts a timeline item back on this device's clipboard without re-offering it.
     pub async fn copy_from_history(&self, id: Uuid) -> Result<()> {
         let item = self.inner.history.lock().unwrap().load(id)?;
@@ -323,6 +348,12 @@ impl Node {
         let path = reserve_path(&wanted).await?;
         tokio::fs::write(&path, bytes).await?;
         Ok(path)
+    }
+
+    /// Adds a payload to the timeline and offers it to peers like a local copy,
+    /// without writing the clipboard or touching the echo guard.
+    pub async fn offer_local(&self, payload: ClipPayload) {
+        self.inner.on_local(payload).await
     }
 
     pub async fn send_clipboard_to(&self, peer: Uuid) -> Result<()> {
@@ -411,6 +442,7 @@ mod tests {
             clipboard: clip.clone(),
             clipboard_poll: Duration::from_millis(20),
             dial_interval: Duration::from_millis(200),
+            history_cap: crate::history::HISTORY_CAP,
         };
         let (node, events) = Node::start(cfg).await.unwrap();
         (node, clip, events)
@@ -687,9 +719,19 @@ mod tests {
             clipboard: Arc::new(MemoryClipboard::new()),
             clipboard_poll: Duration::from_millis(20),
             dial_interval: Duration::from_millis(200),
+            history_cap: crate::history::HISTORY_CAP,
         };
         assert!(Node::start(cfg).await.is_err());
         std::net::UdpSocket::bind(("127.0.0.1", port)).expect("the failed start kept the port bound");
+    }
+
+    #[tokio::test]
+    async fn history_cap_can_change_at_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, _clip) = node(dir.path()).await;
+        assert_eq!(node.history_count().unwrap(), 0);
+        assert!(node.set_history_cap(5).is_err());
+        assert!(node.set_history_cap(50).is_ok());
     }
 
     #[tokio::test]

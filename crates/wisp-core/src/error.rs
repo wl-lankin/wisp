@@ -24,6 +24,8 @@ pub enum CoreError {
     Transfer(String),
     #[error("unknown peer: {0}")]
     UnknownPeer(String),
+    #[error("{0}")]
+    Invalid(String),
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;

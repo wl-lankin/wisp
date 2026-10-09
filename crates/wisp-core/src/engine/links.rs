@@ -6,7 +6,6 @@ use uuid::Uuid;
 
 use super::{Event, Inner};
 use crate::discovery::{Advert, Discovered, Discovery, DiscoveryEvent};
-use crate::identity::cap_device_name;
 use crate::Result;
 
 impl Inner {
@@ -93,14 +92,18 @@ impl Inner {
         });
     }
 
-    pub(super) fn start_discovery(self: &Arc<Self>) -> Result<()> {
-        let advert = Advert {
+    pub(super) fn advert(&self) -> Result<Advert> {
+        Ok(Advert {
             device_id: self.identity.device_id,
-            name: cap_device_name(&self.identity.name),
+            name: self.current_name(),
             os: self.identity.os,
             port: self.transport.local_addr()?.port(),
             fingerprint: self.identity.fingerprint(),
-        };
+        })
+    }
+
+    pub(super) fn start_discovery(self: &Arc<Self>) -> Result<()> {
+        let advert = self.advert()?;
         let (discovery, mut rx) = Discovery::start(&advert)?;
         *self.discovery.lock().unwrap() = Some(discovery);
         let this = self.clone();

@@ -6,6 +6,8 @@
   <true/>
   <key>NSLocalNetworkUsageDescription</key>
   <string>Wisp finds and talks to your other computers on this network.</string>
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>Wisp shares screenshots you save to the Desktop.</string>
   <key>NSBonjourServices</key>
   <array>
     <string>_wisp._udp</string>

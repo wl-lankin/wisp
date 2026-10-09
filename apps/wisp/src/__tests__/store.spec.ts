@@ -65,6 +65,15 @@ describe('reduce', () => {
     expect(s.historyVersion).toBe(1)
   })
 
+  it('resyncs when this device is renamed and renames a peer in place', () => {
+    const s = initialState()
+    applySnapshot(s, snap())
+    expect(reduce(s, { type: 'deviceRenamed' })).toBe(true)
+    expect(reduce(s, { type: 'peerRenamed', peer: mac, name: 'Air' })).toBe(false)
+    expect(s.peers[0].peer.name).toBe('Air')
+    expect(reduce(s, { type: 'peerRenamed', peer: 'unknown', name: 'X' })).toBe(false)
+  })
+
   it('shows an identity warning once per device', () => {
     const s = initialState()
     applySnapshot(s, snap())

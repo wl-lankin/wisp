@@ -2,6 +2,7 @@ mod commands;
 mod dto;
 mod engine;
 mod hotkey;
+mod screenshots;
 mod settings;
 mod tray;
 mod windows;
@@ -28,6 +29,7 @@ pub struct AppState {
     pub tray_rect: Mutex<Option<windows::Rect>>,
     /// When the panel last hid because it lost focus, so the tray click that caused it closes it.
     pub panel_blurred_at: Mutex<Option<Instant>>,
+    pub panel_shown_at: Mutex<Option<Instant>>,
     /// Why the catch shortcut is not registered, shown in the UI until a later registration succeeds.
     pub hotkey_error: Mutex<Option<String>>,
     /// The last clipboard write failure, kept for a toast window that did not exist when it happened.
@@ -36,6 +38,8 @@ pub struct AppState {
     pub hotkey_busy: AtomicBool,
     /// Held for a whole settings change, so two quick saves cannot interleave and undo each other.
     pub settings_change: tokio::sync::Mutex<()>,
+    /// Watches the macOS screenshot folder while screenshot sharing is on.
+    pub screenshots: screenshots::ScreenshotService,
 }
 
 /// The newest clipboard write failure with a sequence number, until a later write succeeds.
@@ -108,6 +112,9 @@ pub(crate) async fn start_engine(app: &AppHandle) {
     if let Err(message) = state.engine.start(&settings, &state.paths, sink).await {
         let _ = app.emit("wisp://event", serde_json::json!({ "type": "error", "message": message }));
     }
+    // Re-read: the setting may have been toggled while the engine was starting.
+    let share = state.settings.lock().unwrap().share_screenshot_files;
+    state.screenshots.sync(app, share);
 }
 
 pub(crate) async fn catch_from_hotkey(app: &AppHandle) {
@@ -199,10 +206,12 @@ pub fn run() {
                 dragging: AtomicBool::new(false),
                 tray_rect: Mutex::new(None),
                 panel_blurred_at: Mutex::new(None),
+                panel_shown_at: Mutex::new(None),
                 hotkey_error: Mutex::new(None),
                 clipboard_error: Mutex::new(ClipboardErrorLog::default()),
                 hotkey_busy: AtomicBool::new(false),
                 settings_change: tokio::sync::Mutex::new(()),
+                screenshots: screenshots::ScreenshotService::default(),
             });
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -221,6 +230,8 @@ pub fn run() {
             commands::snapshot,
             commands::get_settings,
             commands::update_settings,
+            commands::rename_device,
+            commands::history_count,
             commands::complete_onboarding,
             commands::default_device_name,
             commands::pick_folder,

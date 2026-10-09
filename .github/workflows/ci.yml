@@ -47,3 +47,32 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Rust tests
         run: cargo test --workspace
+
+  mac-app:
+    # A universal .dmg per pull request, for trying the Mac build before a release.
+    if: github.event_name == 'pull_request'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/wisp/package-lock.json
+      - name: Install frontend dependencies
+        working-directory: apps/wisp
+        run: npm ci
+      - name: Build the app
+        working-directory: apps/wisp
+        run: npm run tauri build -- --target universal-apple-darwin --bundles dmg
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wisp-macos-dmg
+          path: target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          retention-days: 14
+          if-no-files-found: error

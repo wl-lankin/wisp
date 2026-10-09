@@ -8,7 +8,7 @@ use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
 use uuid::Uuid;
 use wisp_core::engine::{NearbyDevice, PeerStatus};
-use wisp_core::history::HistoryQuery;
+use wisp_core::history::{HistoryQuery, MAX_HISTORY, MIN_HISTORY};
 use wisp_core::item::ItemKind;
 use wisp_core::peers::DeliveryMode;
 
@@ -89,15 +89,17 @@ fn roll_back_hotkey(app: &AppHandle, registered: bool, previous: &AppSettings, n
 #[tauri::command]
 pub async fn update_settings(app: AppHandle, state: State<'_, AppState>, mut next: AppSettings) -> Cmd<AppSettings> {
     let _change = state.settings_change.lock().await;
-    if let Some(name) = next.device_name.take() {
-        let name = name.trim();
-        if name.is_empty() {
-            return Err("Please give this device a name".into());
-        }
-        next.device_name = Some(name.chars().take(64).collect());
-    }
     let previous = state.settings.lock().unwrap().clone();
+    // Renaming goes through rename_device so the engine identity and the settings cannot diverge.
+    next.device_name = previous.device_name.clone();
     crate::hotkey::parse(&next.hotkey)?;
+    let history_changed = next.history_size != previous.history_size;
+    if history_changed {
+        let cap = next.history_size as usize;
+        if !(MIN_HISTORY..=MAX_HISTORY).contains(&cap) {
+            return Err(format!("Keep between {MIN_HISTORY} and {MAX_HISTORY} items"));
+        }
+    }
     // Re-saving an unchanged shortcut re-registers it when something else released it.
     let register_hotkey = previous.onboarded;
     if register_hotkey {
@@ -115,6 +117,22 @@ pub async fn update_settings(app: AppHandle, state: State<'_, AppState>, mut nex
             return Err(e);
         }
     }
+    // Without a running node (before onboarding, or after a failed start) the next start picks the size up.
+    let live_node = if history_changed { state.engine.node().await.ok() } else { None };
+    if let Some(node) = live_node.clone() {
+        let cap = next.history_size as usize;
+        let applied = tauri::async_runtime::spawn_blocking(move || node.set_history_cap(cap))
+            .await
+            .map_err(err)
+            .and_then(|r| r.map_err(err));
+        if let Err(e) = applied {
+            roll_back_hotkey(&app, register_hotkey, &previous, &next);
+            if autostart_changed {
+                let _ = crate::apply_autostart(&app, previous.autostart);
+            }
+            return Err(e);
+        }
+    }
     let saved = match save_settings(&app, &state, next.clone()) {
         Ok(saved) => saved,
         Err(e) => {
@@ -122,13 +140,41 @@ pub async fn update_settings(app: AppHandle, state: State<'_, AppState>, mut nex
             if autostart_changed {
                 let _ = crate::apply_autostart(&app, previous.autostart);
             }
+            if let Some(node) = live_node {
+                let cap = previous.history_size as usize;
+                let _ = tauri::async_runtime::spawn_blocking(move || node.set_history_cap(cap)).await;
+            }
             return Err(e);
         }
     };
     if saved.onboarded && saved.save_dir != previous.save_dir {
         crate::start_engine(&app).await;
+    } else if saved.onboarded && saved.share_screenshot_files != previous.share_screenshot_files {
+        state.screenshots.sync(&app, saved.share_screenshot_files);
     }
     Ok(saved)
+}
+
+/// Renames this device on the network and remembers the new name.
+#[tauri::command]
+pub async fn rename_device(app: AppHandle, state: State<'_, AppState>, name: String) -> Cmd<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Please give this device a name".into());
+    }
+    let _change = state.settings_change.lock().await;
+    let node = state.engine.node().await?;
+    let applied = node.rename(name).await.map_err(err)?;
+    let mut next = state.settings.lock().unwrap().clone();
+    next.device_name = Some(applied.clone());
+    save_settings(&app, &state, next)?;
+    let _ = app.emit("wisp://event", serde_json::json!({ "type": "deviceRenamed" }));
+    Ok(applied)
+}
+
+#[tauri::command]
+pub async fn history_count(state: State<'_, AppState>) -> Cmd<usize> {
+    state.engine.node().await?.history_count().map_err(err)
 }
 
 #[tauri::command]
