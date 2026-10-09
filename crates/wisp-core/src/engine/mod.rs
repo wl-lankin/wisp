@@ -17,7 +17,7 @@ use crate::clipboard::{write_and_mark, ClipboardBackend, EchoGuard};
 use crate::discovery::{DiscoveredSet, Discovery};
 use crate::fsutil::create_private_dir;
 use crate::history::{History, HistoryEntry, HistoryQuery};
-use crate::identity::{Identity, Os};
+use crate::identity::{cap_device_name, Identity, Os};
 use crate::item::{ClipItem, ClipPayload, ItemKind, Preview};
 use crate::pairing::PairingSession;
 use crate::peers::{DeliveryMode, Peer, PeerStore};
@@ -111,6 +111,9 @@ struct Conn {
 
 struct Inner {
     identity: Identity,
+    /// The current device name; `identity.name` is only the name from start-up.
+    name: Mutex<String>,
+    identity_path: PathBuf,
     transport: Transport,
     clipboard: Arc<dyn ClipboardBackend>,
     events: mpsc::UnboundedSender<Event>,
@@ -144,7 +147,8 @@ pub struct Node {
 
 impl Node {
     pub async fn start(cfg: NodeConfig) -> Result<(Node, mpsc::UnboundedReceiver<Event>)> {
-        let identity = Identity::load_or_create(&cfg.data_dir.join("identity.json"), &cfg.device_name)?;
+        let identity_path = cfg.data_dir.join("identity.json");
+        let identity = Identity::load_or_create(&identity_path, &cfg.device_name)?;
         let peers = PeerStore::open(&cfg.data_dir.join("peers.json"))?;
         let history = History::open(&cfg.data_dir.join("history"))?;
         std::fs::create_dir_all(&cfg.save_dir)?;
@@ -164,6 +168,8 @@ impl Node {
         let (events, rx) = mpsc::unbounded_channel();
         let (shutdown, _) = watch::channel(false);
         let inner = Arc::new(Inner {
+            name: Mutex::new(cap_device_name(&identity.name)),
+            identity_path,
             identity,
             transport,
             clipboard: cfg.clipboard,
@@ -206,7 +212,12 @@ impl Node {
     }
 
     pub fn device_name(&self) -> String {
-        self.inner.identity.name.clone()
+        self.inner.current_name()
+    }
+
+    /// Renames this device: persisted, re-advertised and sent to connected peers.
+    pub async fn rename(&self, name: &str) -> Result<String> {
+        self.inner.rename(name).await
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {

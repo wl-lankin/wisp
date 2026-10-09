@@ -375,3 +375,25 @@ async fn timeline_items_export_to_files() {
     assert!(first.starts_with(out.path()));
     assert!(a.node.export_item(uuid::Uuid::new_v4(), out.path()).await.is_err());
 }
+
+#[tokio::test]
+async fn renaming_reaches_connected_peers_and_persists() {
+    let (a, b) = paired().await;
+    let stored = a.node.rename("  Studio Mac  ").await.unwrap();
+    assert_eq!(stored, "Studio Mac");
+    assert_eq!(a.node.device_name(), "Studio Mac");
+    let a_id = a.node.device_id();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if b.node.peers().iter().any(|p| p.peer.device_id == a_id && p.peer.name == "Studio Mac") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("peer never saw the new name");
+    let text = std::fs::read_to_string(a.dir.path().join("data").join("identity.json")).unwrap();
+    assert!(text.contains("Studio Mac"));
+    assert!(a.node.rename("   ").await.is_err());
+}

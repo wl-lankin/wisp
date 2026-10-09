@@ -7,7 +7,7 @@ use uuid::Uuid;
 use super::{Conn, Event, Inner, OfferInfo, StreamKind};
 use crate::clipboard::{spawn_monitor, write_and_mark};
 use crate::fsutil::write_private_file;
-use crate::identity::{cap_device_name, Fingerprint};
+use crate::identity::{cap_device_name, Fingerprint, Identity};
 use crate::item::{ClipItem, ClipPayload, Preview, MAX_CLIP_BYTES};
 use crate::pairing::{pair, PairInfo};
 use crate::peers::{DeliveryMode, Peer};
@@ -60,6 +60,46 @@ fn pairing_timeout() -> CoreError {
 impl Inner {
     pub(super) fn emit(&self, event: Event) {
         let _ = self.events.send(event);
+    }
+
+    pub(super) fn current_name(&self) -> String {
+        self.name.lock().unwrap().clone()
+    }
+
+    /// The identity with the name it has right now, for the pairing exchange.
+    fn pairing_identity(&self) -> Identity {
+        Identity { name: self.current_name(), ..self.identity.clone() }
+    }
+
+    fn hello(&self) -> Message {
+        Message::Hello {
+            device_id: self.identity.device_id,
+            name: self.current_name(),
+            os: self.identity.os,
+            version: PROTOCOL_VERSION,
+        }
+    }
+
+    /// Renames this device: persisted, re-advertised and sent to connected peers.
+    pub(super) async fn rename(self: &Arc<Self>, name: &str) -> Result<String> {
+        let name = cap_device_name(name);
+        if name.is_empty() {
+            return Err(CoreError::Invalid("the device name cannot be empty".into()));
+        }
+        let renamed = Identity { name: name.clone(), ..self.identity.clone() };
+        renamed.save(&self.identity_path)?;
+        *self.name.lock().unwrap() = name.clone();
+        if let Some(discovery) = self.discovery.lock().unwrap().as_ref() {
+            if let Err(e) = self.advert().and_then(|advert| discovery.update(&advert)) {
+                tracing::warn!("could not re-advertise the new name: {e}");
+            }
+        }
+        let conns: Vec<quinn::Connection> = self.conns.lock().unwrap().values().map(|c| c.conn.clone()).collect();
+        let hello = self.hello();
+        for conn in conns {
+            let _ = send_on(&conn, &hello).await;
+        }
+        Ok(name)
     }
 
     pub(super) fn connection(&self, peer: Uuid) -> Option<quinn::Connection> {
@@ -141,7 +181,8 @@ impl Inner {
             conn.close(2u32.into(), b"not pairing");
             return;
         };
-        let exchange = pair(&mut stream, &code, &self.identity, Some(fp));
+        let identity = self.pairing_identity();
+        let exchange = pair(&mut stream, &code, &identity, Some(fp));
         let result = tokio::time::timeout(PAIRING_STREAM_TIMEOUT, exchange)
             .await
             .unwrap_or_else(|_| Err(pairing_timeout()));
@@ -191,7 +232,7 @@ impl Inner {
             let (send, recv) = conn.open_bi().await.map_err(net_err)?;
             let mut stream = tokio::io::join(recv, send);
             write_value(&mut stream, &StreamKind::Pair).await?;
-            pair(&mut stream, code, &self.identity, Some(fp)).await
+            pair(&mut stream, code, &self.pairing_identity(), Some(fp)).await
         };
         let result = tokio::time::timeout(PAIRING_STREAM_TIMEOUT, exchange)
             .await
@@ -261,12 +302,7 @@ impl Inner {
 
         let this = self.clone();
         tokio::spawn(async move {
-            let hello = Message::Hello {
-                device_id: this.identity.device_id,
-                name: cap_device_name(&this.identity.name),
-                os: this.identity.os,
-                version: PROTOCOL_VERSION,
-            };
+            let hello = this.hello();
             let _ = send_on(&conn, &hello).await;
             this.spawn_delivery(peer, conn);
         });

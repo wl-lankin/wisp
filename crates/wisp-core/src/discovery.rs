@@ -133,14 +133,22 @@ pub struct Discovery {
     daemon: ServiceDaemon,
 }
 
+fn mdns_err(e: mdns_sd::Error) -> CoreError {
+    CoreError::Transport(format!("mdns: {e}"))
+}
+
+fn service_info(advert: &Advert) -> std::result::Result<ServiceInfo, mdns_sd::Error> {
+    let instance = advert.device_id.to_string();
+    let host = format!("{instance}.local.");
+    ServiceInfo::new(SERVICE_TYPE, &instance, &host, "", advert.port, txt_properties(advert))
+        .map(ServiceInfo::enable_addr_auto)
+}
+
 impl Discovery {
     pub fn start(advert: &Advert) -> Result<(Self, mpsc::UnboundedReceiver<DiscoveryEvent>)> {
-        let mdns_err = |e: mdns_sd::Error| CoreError::Transport(format!("mdns: {e}"));
         let daemon = ServiceDaemon::new().map_err(mdns_err)?;
-        let instance = advert.device_id.to_string();
-        let host = format!("{instance}.local.");
-        let registered = ServiceInfo::new(SERVICE_TYPE, &instance, &host, "", advert.port, txt_properties(advert))
-            .and_then(|info| daemon.register(info.enable_addr_auto()))
+        let registered = service_info(advert)
+            .and_then(|info| daemon.register(info))
             .and_then(|()| daemon.browse(SERVICE_TYPE));
         let browse = match registered {
             Ok(browse) => browse,
@@ -182,6 +190,16 @@ impl Discovery {
             }
         });
         Ok((Self { daemon }, rx))
+    }
+
+    /// Re-announces this device with new details (for example a new name).
+    pub fn update(&self, advert: &Advert) -> Result<()> {
+        let info = service_info(advert).map_err(mdns_err)?;
+        let fullname = info.get_fullname().to_string();
+        // Commands run in order on the daemon thread, so the old record is gone before the new
+        // one is announced.
+        self.daemon.unregister(&fullname).map_err(mdns_err)?;
+        self.daemon.register(info).map_err(mdns_err)
     }
 
     pub fn stop(self) {

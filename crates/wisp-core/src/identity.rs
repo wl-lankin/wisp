@@ -175,6 +175,12 @@ impl Identity {
         Ok(identity)
     }
 
+    /// Writes the identity back atomically with owner-only permissions.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        write_atomic_private(path, &serde_json::to_vec_pretty(self)?)?;
+        Ok(())
+    }
+
     pub fn fingerprint(&self) -> Fingerprint {
         Fingerprint::of(&self.cert_der)
     }
@@ -201,6 +207,18 @@ mod tests {
         let second = Identity::load_or_create(&path, "Other name").unwrap();
         assert_eq!(first, second);
         assert_eq!(second.name, "Laptop");
+    }
+
+    #[test]
+    fn save_round_trips_a_changed_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.json");
+        let mut identity = Identity::load_or_create(&path, "Laptop").unwrap();
+        identity.name = "Studio".into();
+        identity.save(&path).unwrap();
+        let loaded = Identity::load_or_create(&path, "Other").unwrap();
+        assert_eq!(loaded, identity);
+        assert_eq!(loaded.name, "Studio");
     }
 
     #[test]
