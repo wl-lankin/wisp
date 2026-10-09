@@ -44,7 +44,9 @@ fn link_domain(t: &str) -> Option<String> {
         return None;
     }
     let rest = t.strip_prefix("https://").or_else(|| t.strip_prefix("http://"))?;
-    let host_port = rest.split(['/', '?', '#']).next()?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    // Anything before the last '@' is userinfo, which can be dressed up to look like a host.
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
     let host = host_port.rsplit_once(':').map_or(host_port, |(h, _)| h);
     (!host.is_empty()).then(|| host.to_lowercase())
 }
@@ -54,7 +56,17 @@ fn is_color(t: &str) -> bool {
         return matches!(hex.len(), 3 | 4 | 6 | 8) && hex.chars().all(|c| c.is_ascii_hexdigit());
     }
     let lower = t.to_ascii_lowercase();
-    ["rgb(", "rgba(", "hsl(", "hsla("].iter().any(|p| lower.starts_with(p)) && lower.ends_with(')')
+    let Some(inner) = ["rgb(", "rgba(", "hsl(", "hsla("]
+        .iter()
+        .find_map(|p| lower.strip_prefix(p))
+        .and_then(|rest| rest.strip_suffix(')'))
+    else {
+        return false;
+    };
+    // Only numbers and their separators, so nothing like url(...) or var(...) can ride along.
+    let plain = inner.replace("deg", "");
+    plain.chars().any(|c| c.is_ascii_digit())
+        && plain.chars().all(|c| c.is_ascii_digit() || matches!(c, ' ' | '.' | ',' | '%' | '/'))
 }
 
 pub fn preview_dto(p: &Preview) -> PreviewDto {
@@ -107,6 +119,25 @@ mod tests {
         assert_eq!(classify("Meeting at 3, bring snacks"), SmartKind::Plain);
         assert_eq!(classify("see https://example.org for details"), SmartKind::Plain);
         assert_eq!(classify("#hashtag"), SmartKind::Plain);
+    }
+
+    #[test]
+    fn link_domains_ignore_userinfo() {
+        assert_eq!(classify("https://good.com:x@evil.com/"), SmartKind::Link { domain: "evil.com".into() });
+        assert_eq!(classify("https://user@example.org:8443/a"), SmartKind::Link { domain: "example.org".into() });
+        assert_eq!(classify("https://a@b@host.net"), SmartKind::Link { domain: "host.net".into() });
+    }
+
+    #[test]
+    fn colors_only_accept_plain_numeric_functions() {
+        assert!(is_color("rgba(45, 226, 197, 0.5)"));
+        assert!(is_color("rgb(45 226 197 / 50%)"));
+        assert!(is_color("hsl(170deg, 76%, 53%)"));
+        assert!(is_color("HSLA(170, 76%, 53%, .4)"));
+        assert!(!is_color("rgb(url(https://evil.example/x))"));
+        assert!(!is_color("rgb(var(--x))"));
+        assert!(!is_color("rgb()"));
+        assert!(!is_color("rgb(1,2,3);background:red)"));
     }
 
     #[test]
