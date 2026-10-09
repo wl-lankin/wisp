@@ -6,6 +6,7 @@ import { useAppStore } from '../lib/appStore'
 import { comboFromEvent, comboProblem, displayCombo } from '../lib/hotkeys'
 import { osLabel } from '../lib/format'
 import IconGlyph from '../components/IconGlyph.vue'
+import WindowBar from '../components/WindowBar.vue'
 import { dismissNotice, pushNotice } from '../lib/store'
 import type { AppSettings, DeliveryMode, Theme } from '../lib/types'
 
@@ -210,8 +211,9 @@ const themes: { id: Theme; name: string }[] = [
 
 <template>
   <main class="flex h-screen flex-col gap-6 overflow-y-auto p-6 text-[13px]" tabindex="-1">
-    <header class="flex items-baseline justify-between">
-      <h1 class="accent-text text-xl font-semibold tracking-tight">Settings</h1>
+    <WindowBar class="-mx-6 -mt-6 -mb-4" />
+    <header data-tauri-drag-region class="flex items-baseline justify-between">
+      <h1 data-tauri-drag-region class="accent-text text-xl font-semibold tracking-tight">Settings</h1>
       <span class="text-[12px] text-[var(--muted)]" role="status">{{ message }}</span>
     </header>
 

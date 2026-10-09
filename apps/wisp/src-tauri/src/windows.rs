@@ -126,9 +126,21 @@ fn builder<'a>(app: &'a AppHandle, view: View) -> WebviewWindowBuilder<'a, tauri
             .resizable(false)
             .skip_taskbar(true)
             .center(),
-        View::Timeline => b.title("Wisp timeline").inner_size(1040.0, 720.0).min_inner_size(640.0, 480.0).center(),
-        View::Settings => b.title("Wisp settings").inner_size(560.0, 640.0).resizable(false).center(),
+        View::Timeline => frameless(b.title("Wisp timeline").inner_size(1040.0, 720.0).min_inner_size(640.0, 480.0).center()),
+        View::Settings => frameless(b.title("Wisp settings").inner_size(560.0, 640.0).resizable(false).center()),
     }
+}
+
+/// No title bar: the page draws its own drag strip. Windows keeps the system frame, shadow and resize
+/// edges; macOS keeps its traffic lights floating over the content.
+fn frameless<'a>(
+    b: WebviewWindowBuilder<'a, tauri::Wry, AppHandle>,
+) -> WebviewWindowBuilder<'a, tauri::Wry, AppHandle> {
+    #[cfg(target_os = "macos")]
+    let b = b.title_bar_style(tauri::TitleBarStyle::Overlay).hidden_title(true);
+    #[cfg(not(target_os = "macos"))]
+    let b = b.decorations(false);
+    b
 }
 
 fn apply_material(window: &WebviewWindow, view: View) {
