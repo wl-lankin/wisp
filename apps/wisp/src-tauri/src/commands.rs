@@ -15,6 +15,7 @@ use wisp_core::peers::DeliveryMode;
 use crate::dto::with_ui_preview;
 use crate::engine::parse_peer_addr;
 use crate::settings::AppSettings;
+use crate::windows::View;
 use crate::AppState;
 
 type Cmd<T> = Result<T, String>;
@@ -92,6 +93,8 @@ pub async fn complete_onboarding(app: AppHandle, state: State<'_, AppState>, dev
     next.onboarded = true;
     save_settings(&app, &state, next)?;
     crate::start_engine(&app).await;
+    crate::windows::hide(&app, View::Onboarding);
+    let _ = crate::windows::show(&app, View::Panel);
     Ok(())
 }
 
@@ -132,18 +135,23 @@ pub async fn forget(state: State<'_, AppState>, peer: Uuid) -> Cmd<()> {
 }
 
 #[tauri::command]
-pub async fn catch(state: State<'_, AppState>, item_id: Uuid) -> Cmd<()> {
-    state.engine.node().await?.catch(item_id).await.map_err(err)
+pub async fn catch(app: AppHandle, state: State<'_, AppState>, item_id: Uuid) -> Cmd<()> {
+    let result = state.engine.node().await?.catch(item_id).await.map_err(err);
+    crate::tray::refresh(&app).await;
+    result
 }
 
 #[tauri::command]
-pub async fn catch_latest(state: State<'_, AppState>) -> Cmd<Option<Uuid>> {
-    state.engine.node().await?.catch_latest().await.map_err(err)
+pub async fn catch_latest(app: AppHandle, state: State<'_, AppState>) -> Cmd<Option<Uuid>> {
+    let result = state.engine.node().await?.catch_latest().await.map_err(err);
+    crate::tray::refresh(&app).await;
+    result
 }
 
 #[tauri::command]
-pub async fn dismiss(state: State<'_, AppState>, item_id: Uuid) -> Cmd<()> {
+pub async fn dismiss(app: AppHandle, state: State<'_, AppState>, item_id: Uuid) -> Cmd<()> {
     state.engine.node().await?.dismiss(item_id);
+    crate::tray::refresh(&app).await;
     Ok(())
 }
 
@@ -159,7 +167,9 @@ pub async fn save_offer(app: AppHandle, state: State<'_, AppState>, item_id: Uui
     let node = state.engine.node().await?;
     let kind = node.inbox().iter().find(|o| o.item_id == item_id).map(|o| o.kind);
     let kind = kind.ok_or_else(|| "This offer is no longer available".to_string())?;
-    node.catch(item_id).await.map_err(err)?;
+    let caught = node.catch(item_id).await.map_err(err);
+    crate::tray::refresh(&app).await;
+    caught?;
     let dir = save_dir(&state);
     if kind == ItemKind::File {
         tokio::fs::create_dir_all(&dir).await.map_err(err)?;
@@ -222,4 +232,23 @@ pub async fn send_files(state: State<'_, AppState>, peer: Uuid, paths: Vec<Strin
 pub async fn add_address(state: State<'_, AppState>, peer: Uuid, addr: String) -> Cmd<()> {
     let addr = parse_peer_addr(&addr)?;
     state.engine.node().await?.add_address(peer, addr).map_err(err)
+}
+
+/// Async on purpose: creating a window from a synchronous command deadlocks on Windows.
+#[tauri::command]
+pub async fn open_window(app: AppHandle, name: String) -> Cmd<()> {
+    let view = View::from_label(&name).ok_or_else(|| format!("unknown window {name}"))?;
+    crate::windows::show(&app, view).map(|_| ()).map_err(err)
+}
+
+#[tauri::command]
+pub fn hide_window(app: AppHandle, name: String) -> Cmd<()> {
+    let view = View::from_label(&name).ok_or_else(|| format!("unknown window {name}"))?;
+    crate::windows::hide(&app, view);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn fit_toast(app: AppHandle, height: f64) {
+    crate::windows::fit_toast(&app, height);
 }

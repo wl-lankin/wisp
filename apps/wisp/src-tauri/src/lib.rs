@@ -2,6 +2,8 @@ mod commands;
 mod dto;
 mod engine;
 mod settings;
+mod tray;
+mod windows;
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -31,7 +33,20 @@ impl EventSink for TauriSink {
         let _ = self.app.emit("wisp://event", value);
     }
 
-    fn react(&self, _event: &Event) {}
+    fn react(&self, event: &Event) {
+        match event {
+            Event::OfferReceived(_) => {
+                let _ = windows::show(&self.app, windows::View::Toast);
+                let app = self.app.clone();
+                tauri::async_runtime::spawn(async move { tray::refresh(&app).await });
+            }
+            Event::ClipboardApplied { .. } => {
+                let app = self.app.clone();
+                tauri::async_runtime::spawn(async move { tray::refresh(&app).await });
+            }
+            _ => {}
+        }
+    }
 }
 
 pub(crate) async fn start_engine(app: &AppHandle) {
@@ -47,6 +62,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_positioner::init())
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             let default_save_dir = app.path().download_dir()?.join("Wisp");
@@ -60,9 +76,14 @@ pub fn run() {
                 settings_path,
                 dragging: AtomicBool::new(false),
             });
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            tray::install(app.handle())?;
             if onboarded {
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move { start_engine(&handle).await });
+            } else {
+                windows::show(app.handle(), windows::View::Onboarding)?;
             }
             Ok(())
         })
@@ -87,6 +108,9 @@ pub fn run() {
             commands::send_clipboard_to,
             commands::send_files,
             commands::add_address,
+            commands::open_window,
+            commands::hide_window,
+            commands::fit_toast,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build the Wisp app")
