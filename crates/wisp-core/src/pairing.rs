@@ -4,7 +4,7 @@ use spake2::{Ed25519Group, Identity as SpakeIdentity, Password, Spake2};
 use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
 
-use crate::identity::{Fingerprint, Identity, Os};
+use crate::identity::{cap_device_name, Fingerprint, Identity, Os};
 use crate::protocol::{read_value_max, write_value};
 use crate::{CoreError, Result};
 
@@ -69,7 +69,7 @@ async fn exchange_info<S: AsyncRead + AsyncWrite + Unpin>(
 
     let mine = PairInfo {
         device_id: me.device_id,
-        name: me.name.clone(),
+        name: cap_device_name(&me.name),
         os: me.os,
         fingerprint: me.fingerprint(),
     };
@@ -89,7 +89,7 @@ async fn exchange_info<S: AsyncRead + AsyncWrite + Unpin>(
             return Err(CoreError::Pairing("certificate does not match paired identity".into()));
         }
     }
-    Ok(theirs.info)
+    Ok(PairInfo { name: cap_device_name(&theirs.info.name), ..theirs.info })
 }
 
 /// The MAC covers the sender's own key-exchange message, so a MAC cannot be reflected back.
@@ -166,6 +166,20 @@ mod tests {
         assert_eq!(seen_by_mac.fingerprint, pc.fingerprint());
         assert_eq!(seen_by_pc.device_id, mac.device_id);
         assert_eq!(seen_by_pc.name, "Mac");
+    }
+
+    #[tokio::test]
+    async fn long_device_names_still_fit_the_pairing_frame() {
+        let mut mac = Identity::generate("Mac").unwrap();
+        mac.name = "x".repeat(5000);
+        let pc = Identity::generate("PC").unwrap();
+        let (mut a, mut b) = tokio::io::duplex(64 * 1024);
+        let (ra, rb) = tokio::join!(
+            pair(&mut a, "123456", &mac, Some(pc.fingerprint())),
+            pair(&mut b, "123456", &pc, Some(mac.fingerprint())),
+        );
+        ra.unwrap();
+        assert_eq!(rb.unwrap().name, "x".repeat(64));
     }
 
     #[tokio::test]

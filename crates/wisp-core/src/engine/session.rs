@@ -7,7 +7,7 @@ use uuid::Uuid;
 use super::{Conn, Event, Inner, OfferInfo, StreamKind};
 use crate::clipboard::{spawn_monitor, write_and_mark};
 use crate::fsutil::write_private_file;
-use crate::identity::Fingerprint;
+use crate::identity::{cap_device_name, Fingerprint};
 use crate::item::{ClipItem, ClipPayload, Preview, MAX_CLIP_BYTES};
 use crate::pairing::{pair, PairInfo};
 use crate::peers::{DeliveryMode, Peer};
@@ -263,7 +263,7 @@ impl Inner {
         tokio::spawn(async move {
             let hello = Message::Hello {
                 device_id: this.identity.device_id,
-                name: this.identity.name.clone(),
+                name: cap_device_name(&this.identity.name),
                 os: this.identity.os,
                 version: PROTOCOL_VERSION,
             };
@@ -352,6 +352,7 @@ impl Inner {
     async fn handle_uni(self: &Arc<Self>, peer: Uuid, mut recv: quinn::RecvStream) -> Result<()> {
         match read_frame(&mut recv).await? {
             Message::Hello { name, .. } => {
+                let name = cap_device_name(&name);
                 let mut peers = self.peers.lock().unwrap();
                 if let Some(existing) = peers.get(peer).cloned() {
                     if existing.name != name {

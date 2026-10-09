@@ -6,7 +6,7 @@ use std::time::Duration;
 use serde::Serialize;
 use tempfile::TempDir;
 use tokio::sync::mpsc::UnboundedReceiver;
-use wisp_core::clipboard::MemoryClipboard;
+use wisp_core::clipboard::{ClipboardBackend, MemoryClipboard};
 use wisp_core::engine::{Event, Node, NodeConfig};
 use wisp_core::history::HistoryQuery;
 use wisp_core::identity::Identity;
@@ -36,7 +36,7 @@ async fn start_in(dir: TempDir, name: &str) -> TestNode {
     TestNode { node, events, clip, dir }
 }
 
-fn config(dir: &Path, name: &str, clip: Arc<MemoryClipboard>) -> NodeConfig {
+fn config(dir: &Path, name: &str, clip: Arc<dyn ClipboardBackend>) -> NodeConfig {
     NodeConfig {
         data_dir: dir.join("data"),
         save_dir: dir.join("save"),
@@ -292,4 +292,65 @@ async fn a_forgotten_peer_redialing_does_not_use_up_pairing_attempts() {
     }
     assert_eq!(failures, 2, "only the two wrong codes may fail");
     drop(b);
+}
+
+/// Hands back images re-encoded, like an OS clipboard that converts what it is given.
+#[derive(Default)]
+struct Reencoding {
+    inner: MemoryClipboard,
+}
+
+impl ClipboardBackend for Reencoding {
+    fn read(&self) -> wisp_core::Result<Option<ClipPayload>> {
+        Ok(self.inner.current().map(|p| match p {
+            ClipPayload::Image { mut png, width, height } => {
+                png.push(0);
+                ClipPayload::Image { png, width, height }
+            }
+            other => other,
+        }))
+    }
+    fn write(&self, payload: &ClipPayload) -> wisp_core::Result<()> {
+        self.inner.write(payload)
+    }
+    fn change_count(&self) -> u64 {
+        self.inner.change_count()
+    }
+}
+
+async fn assert_no_bounce(events: &mut UnboundedReceiver<Event>) {
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    while let Ok(e) = events.try_recv() {
+        assert!(!matches!(e, Event::OfferReceived(_) | Event::ClipboardApplied { .. }), "item bounced back: {e:?}");
+    }
+}
+
+#[tokio::test]
+async fn auto_sync_both_ways_with_a_reencoding_clipboard_does_not_bounce() {
+    let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (clip_a, clip_b) = (Arc::new(Reencoding::default()), Arc::new(Reencoding::default()));
+    let (a, mut a_events) = Node::start(config(dir_a.path(), "Mac", clip_a.clone())).await.unwrap();
+    let (b, mut b_events) = Node::start(config(dir_b.path(), "PC", clip_b.clone())).await.unwrap();
+    let code = b.begin_pairing();
+    a.pair_with(b.local_addr().unwrap(), &code).await.unwrap();
+    wait_for(&mut a_events, "a online", |e| matches!(e, Event::PeerOnline { .. })).await;
+    wait_for(&mut b_events, "b online", |e| matches!(e, Event::PeerOnline { .. })).await;
+    a.set_mode(b.device_id(), DeliveryMode::AutoSync).unwrap();
+    b.set_mode(a.device_id(), DeliveryMode::AutoSync).unwrap();
+
+    let first = ClipPayload::Image { png: vec![1u8; 2_000], width: 20, height: 10 };
+    clip_a.inner.set_external(first);
+    wait_for(&mut b_events, "applied on b", |e| matches!(e, Event::ClipboardApplied { .. })).await;
+    assert_no_bounce(&mut a_events).await;
+    assert_no_bounce(&mut b_events).await;
+
+    let second = ClipPayload::Image { png: vec![2u8; 2_000], width: 20, height: 10 };
+    clip_b.inner.set_external(second);
+    wait_for(&mut a_events, "applied on a", |e| matches!(e, Event::ClipboardApplied { .. })).await;
+    assert_no_bounce(&mut b_events).await;
+    assert_no_bounce(&mut a_events).await;
+
+    for node in [&a, &b] {
+        assert_eq!(node.history(&HistoryQuery::default()).unwrap().len(), 2, "one entry per copy, no echoes");
+    }
 }

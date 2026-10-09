@@ -5,7 +5,7 @@ use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::identity::{Fingerprint, Os};
+use crate::identity::{cap_device_name, Fingerprint, Os};
 use crate::peers::MAX_ADDRESSES;
 use crate::{CoreError, Result};
 
@@ -56,7 +56,7 @@ pub fn txt_properties(a: &Advert) -> HashMap<String, String> {
     HashMap::from([
         ("v".to_string(), "1".to_string()),
         ("id".to_string(), a.device_id.to_string()),
-        ("name".to_string(), a.name.clone()),
+        ("name".to_string(), cap_device_name(&a.name)),
         ("os".to_string(), os_code(a.os).to_string()),
         ("fp".to_string(), a.fingerprint.to_hex()),
     ])
@@ -73,7 +73,7 @@ fn usable(ip: &IpAddr) -> bool {
 
 pub fn parse_txt(props: &HashMap<String, String>, ips: &[IpAddr], port: u16) -> Option<Discovered> {
     let device_id = Uuid::parse_str(props.get("id")?).ok()?;
-    let name = props.get("name")?.clone();
+    let name = cap_device_name(props.get("name")?);
     let os = os_from_code(props.get("os")?)?;
     let fingerprint = Fingerprint::from_hex(props.get("fp")?)?;
     let mut ips: Vec<IpAddr> = ips.iter().copied().filter(usable).collect();
@@ -213,6 +213,17 @@ mod tests {
         assert_eq!(d.os, Os::Windows);
         assert_eq!(d.fingerprint, a.fingerprint);
         assert_eq!(d.addresses, vec!["192.168.1.20:47800".parse::<SocketAddr>().unwrap()]);
+    }
+
+    #[test]
+    fn long_names_fit_in_one_txt_string() {
+        let a = Advert { name: "\u{1f600}".repeat(200), ..advert() };
+        for (key, value) in txt_properties(&a) {
+            assert!(key.len() + 1 + value.len() <= 255, "{key} is {} bytes", value.len());
+        }
+        let mut props = txt_properties(&advert());
+        props.insert("name".into(), "x".repeat(250));
+        assert!(parse_txt(&props, &[], 1).unwrap().name.chars().count() <= 64);
     }
 
     #[test]

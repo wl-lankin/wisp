@@ -24,6 +24,24 @@ impl Os {
     }
 }
 
+pub const MAX_DEVICE_NAME_CHARS: usize = 64;
+/// Keeps `name=<value>` inside one 255-byte mDNS TXT string, even for 4-byte characters.
+pub const MAX_DEVICE_NAME_BYTES: usize = 200;
+
+/// Trims a device name and cuts it to `MAX_DEVICE_NAME_CHARS` characters and
+/// `MAX_DEVICE_NAME_BYTES` bytes, always on a char boundary. Applied to our own name and to
+/// every name a peer announces, so names fit the pairing frame and the TXT record.
+pub fn cap_device_name(name: &str) -> String {
+    let mut out = String::new();
+    for ch in name.trim().chars().take(MAX_DEVICE_NAME_CHARS) {
+        if out.len() + ch.len_utf8() > MAX_DEVICE_NAME_BYTES {
+            break;
+        }
+        out.push(ch);
+    }
+    out.trim_end().to_string()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Fingerprint(pub [u8; 32]);
 
@@ -135,7 +153,7 @@ impl Identity {
         let certified = rcgen::generate_simple_self_signed(vec![format!("{device_id}.wisp")])?;
         Ok(Self {
             device_id,
-            name: name.to_string(),
+            name: cap_device_name(name),
             os: Os::current(),
             cert_der: certified.cert.der().to_vec(),
             key_der: certified.key_pair.serialize_der(),
@@ -144,7 +162,11 @@ impl Identity {
 
     pub fn load_or_create(path: &Path, default_name: &str) -> Result<Self> {
         match std::fs::read(path) {
-            Ok(bytes) => return Ok(serde_json::from_slice(&bytes)?),
+            Ok(bytes) => {
+                let mut identity: Self = serde_json::from_slice(&bytes)?;
+                identity.name = cap_device_name(&identity.name);
+                return Ok(identity);
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
@@ -200,6 +222,15 @@ mod tests {
         let wire = postcard::to_allocvec(&fp).unwrap();
         assert_eq!(wire.len(), 32);
         assert_eq!(postcard::from_bytes::<Fingerprint>(&wire).unwrap(), fp);
+    }
+
+    #[test]
+    fn long_device_names_are_capped_on_a_char_boundary() {
+        let id = Identity::generate(&"\u{00e4}".repeat(300)).unwrap();
+        assert_eq!(id.name, "\u{00e4}".repeat(64));
+        let id = Identity::generate(&"\u{1f600}".repeat(100)).unwrap();
+        assert!(id.name.len() <= 200 && id.name.chars().all(|c| c == '\u{1f600}'), "{} bytes", id.name.len());
+        assert_eq!(Identity::generate("  Desk PC  ").unwrap().name, "Desk PC");
     }
 
     #[test]
