@@ -21,7 +21,7 @@
   "devDependencies": {
     "@tailwindcss/vite": "^4.1.0",
     "@tauri-apps/cli": "^2.8.0",
-    "@types/node": "^24.19.2",
+    "@types/node": "^22",
     "@vitejs/plugin-vue": "^6.0.0",
     "@vue/test-utils": "^2.4.0",
     "jsdom": "^26.0.0",
