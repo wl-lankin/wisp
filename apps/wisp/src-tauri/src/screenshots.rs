@@ -31,7 +31,8 @@ impl ScreenshotService {
         let on_shot = std::sync::Arc::new(move |payload| {
             let handle = handle.clone();
             tauri::async_runtime::spawn(async move {
-                // Resolved per shot, so an engine restart is transparent.
+                // Resolved per shot, so an engine restart is transparent. A shot taken while the
+                // engine is restarting has no node yet and is dropped.
                 if let Ok(node) = handle.state::<crate::AppState>().engine.node().await {
                     node.offer_local(payload).await;
                 }

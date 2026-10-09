@@ -111,7 +111,9 @@ pub(crate) async fn start_engine(app: &AppHandle) {
     if let Err(message) = state.engine.start(&settings, &state.paths, sink).await {
         let _ = app.emit("wisp://event", serde_json::json!({ "type": "error", "message": message }));
     }
-    state.screenshots.sync(app, settings.share_screenshot_files);
+    // Re-read: the setting may have been toggled while the engine was starting.
+    let share = state.settings.lock().unwrap().share_screenshot_files;
+    state.screenshots.sync(app, share);
 }
 
 pub(crate) async fn catch_from_hotkey(app: &AppHandle) {

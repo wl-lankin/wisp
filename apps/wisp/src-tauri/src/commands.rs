@@ -89,14 +89,9 @@ fn roll_back_hotkey(app: &AppHandle, registered: bool, previous: &AppSettings, n
 #[tauri::command]
 pub async fn update_settings(app: AppHandle, state: State<'_, AppState>, mut next: AppSettings) -> Cmd<AppSettings> {
     let _change = state.settings_change.lock().await;
-    if let Some(name) = next.device_name.take() {
-        let name = name.trim();
-        if name.is_empty() {
-            return Err("Please give this device a name".into());
-        }
-        next.device_name = Some(name.chars().take(64).collect());
-    }
     let previous = state.settings.lock().unwrap().clone();
+    // Renaming goes through rename_device so the engine identity and the settings cannot diverge.
+    next.device_name = previous.device_name.clone();
     crate::hotkey::parse(&next.hotkey)?;
     let history_changed = next.history_size != previous.history_size;
     if history_changed {
@@ -122,18 +117,14 @@ pub async fn update_settings(app: AppHandle, state: State<'_, AppState>, mut nex
             return Err(e);
         }
     }
-    if history_changed {
-        let node = state.engine.node().await;
-        let applied = match node {
-            Ok(node) => {
-                let cap = next.history_size as usize;
-                tauri::async_runtime::spawn_blocking(move || node.set_history_cap(cap))
-                    .await
-                    .map_err(err)
-                    .and_then(|r| r.map_err(err))
-            }
-            Err(e) => Err(e),
-        };
+    // Without a running node (before onboarding, during a restart) the next start picks the size up.
+    let live_node = if history_changed { state.engine.node().await.ok() } else { None };
+    if let Some(node) = live_node.clone() {
+        let cap = next.history_size as usize;
+        let applied = tauri::async_runtime::spawn_blocking(move || node.set_history_cap(cap))
+            .await
+            .map_err(err)
+            .and_then(|r| r.map_err(err));
         if let Err(e) = applied {
             roll_back_hotkey(&app, register_hotkey, &previous, &next);
             if autostart_changed {
@@ -148,6 +139,10 @@ pub async fn update_settings(app: AppHandle, state: State<'_, AppState>, mut nex
             roll_back_hotkey(&app, register_hotkey, &previous, &next);
             if autostart_changed {
                 let _ = crate::apply_autostart(&app, previous.autostart);
+            }
+            if let Some(node) = live_node {
+                let cap = previous.history_size as usize;
+                let _ = tauri::async_runtime::spawn_blocking(move || node.set_history_cap(cap)).await;
             }
             return Err(e);
         }
