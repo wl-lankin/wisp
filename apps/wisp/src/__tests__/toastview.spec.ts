@@ -114,6 +114,37 @@ describe('ToastView', () => {
     w.unmount()
   })
 
+  it('ignores a non-clipboard error that arrived while hidden', async () => {
+    const { api, w } = await setup()
+    await vi.advanceTimersByTimeAsync(9000)
+    expect(api.hideWindow).toHaveBeenCalledTimes(1)
+    pushNotice(state, 'error', 'Transfer failed')
+    await flushPromises()
+    expect((w.element as HTMLElement).style.opacity).toBe('0')
+    reduce(state, { type: 'offerReceived', ...offer('2') })
+    await flushPromises()
+    expect(w.text()).not.toContain('Transfer failed')
+    await vi.advanceTimersByTimeAsync(9000)
+    expect(api.hideWindow).toHaveBeenCalledTimes(2)
+    w.unmount()
+  })
+
+  it('does not wake again when a newer error is dismissed', async () => {
+    const { api, w } = await setup()
+    state.inbox = []
+    pushNotice(state, 'error', 'First problem')
+    pushNotice(state, 'error', 'Second problem')
+    await flushPromises()
+    await w.find('[data-testid="toast-error"] button').trigger('click')
+    await flushPromises()
+    expect(w.text()).toContain('First problem')
+    await w.find('[data-testid="toast-error"] button').trigger('click')
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(w.text()).not.toContain('problem')
+    expect(api.hideWindow).toHaveBeenCalledTimes(1)
+    w.unmount()
+  })
+
   it('shows the shortcut with Mac names on macOS', async () => {
     state.platform = 'macos'
     const { w } = await setup()
