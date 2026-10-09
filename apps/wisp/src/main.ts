@@ -20,4 +20,6 @@ export function viewFor(search: string): Component {
 }
 
 document.documentElement.dataset.view = new URLSearchParams(location.search).get('view') ?? 'panel'
+// Windows 11 draws its own rounded frame around the undecorated panel and onboarding windows.
+document.documentElement.dataset.os = navigator.userAgent.includes('Windows') ? 'windows' : 'other'
 createApp(viewFor(location.search)).mount('#app')

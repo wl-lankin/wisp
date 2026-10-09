@@ -68,6 +68,12 @@ body {
   border-radius: 18px;
 }
 
+:root[data-os='windows'][data-view='panel'] main.glass,
+:root[data-os='windows'][data-view='onboarding'] main.glass {
+  border: 0;
+  border-radius: 0;
+}
+
 .accent-text {
   background: linear-gradient(120deg, var(--accent-a), var(--accent-b));
   -webkit-background-clip: text;
