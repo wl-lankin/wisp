@@ -210,8 +210,8 @@ const themes: { id: Theme; name: string }[] = [
 </script>
 
 <template>
-  <main class="flex h-screen flex-col gap-6 overflow-y-auto p-6 text-[13px]" tabindex="-1">
-    <WindowBar class="-mx-6 -mt-6 -mb-4" />
+  <main class="flex h-screen flex-col gap-6 overflow-y-auto px-6 pb-6 pt-12 text-[13px]" tabindex="-1">
+    <WindowBar />
     <header data-tauri-drag-region class="flex items-baseline justify-between">
       <h1 data-tauri-drag-region class="accent-text text-xl font-semibold tracking-tight">Settings</h1>
       <span class="text-[12px] text-[var(--muted)]" role="status">{{ message }}</span>

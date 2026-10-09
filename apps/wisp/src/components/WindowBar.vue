@@ -12,7 +12,7 @@ const close = () => getCurrentWindow().close()
 </script>
 
 <template>
-  <div data-tauri-drag-region class="window-bar sticky top-0 z-20 flex h-9 shrink-0 items-stretch justify-end bg-[var(--bg)]">
+  <div data-tauri-drag-region class="window-bar fixed inset-x-0 top-0 z-20 flex h-9 shrink-0 items-stretch justify-end bg-[var(--bg)]">
     <template v-if="!isMac">
       <button data-testid="window-minimize" class="window-button hoverable" title="Minimize" @click="minimize">
         <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M0 5h10" stroke="currentColor" /></svg>

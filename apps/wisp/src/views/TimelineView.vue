@@ -83,8 +83,8 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <main class="flex h-screen flex-col gap-4 p-6">
-    <WindowBar maximizable class="-mx-6 -mt-6 -mb-2" />
+  <main class="flex h-screen flex-col gap-4 px-6 pb-6 pt-12">
+    <WindowBar maximizable />
     <header data-tauri-drag-region class="flex flex-wrap items-center gap-4">
       <h1 data-tauri-drag-region class="accent-text text-xl font-semibold tracking-tight">Timeline</h1>
       <div class="w-80"><SearchField v-model="filters.text" placeholder="Search everything you copied" /></div>
