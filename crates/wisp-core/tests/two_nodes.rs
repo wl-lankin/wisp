@@ -208,3 +208,52 @@ async fn auto_sync_applies_immediately_without_echo() {
     }
     assert_eq!(b.node.history(&HistoryQuery::default()).unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn files_arrive_in_the_save_folder() {
+    let (mut a, mut b) = paired().await;
+    let src = tempfile::tempdir().unwrap();
+    std::fs::write(src.path().join("report.pdf"), vec![7u8; 700_000]).unwrap();
+    let ids = a.node.send_files(b.node.device_id(), vec![src.path().join("report.pdf")]).await.unwrap();
+    assert_eq!(ids.len(), 1);
+
+    let Event::TransferDone { path: Some(path), .. } =
+        wait_for(&mut b.events, "file saved", |e| matches!(e, Event::TransferDone { path: Some(_), .. })).await
+    else {
+        unreachable!()
+    };
+    assert_eq!(path, b.dir.path().join("save").join("report.pdf"));
+    assert_eq!(std::fs::read(&path).unwrap().len(), 700_000);
+    wait_for(&mut a.events, "sender done", |e| matches!(e, Event::TransferDone { path: None, .. })).await;
+}
+
+#[tokio::test]
+async fn sending_to_an_unknown_peer_errors() {
+    let (a, _b) = paired().await;
+    assert!(a.node.send_files(uuid::Uuid::new_v4(), vec![]).await.is_err());
+}
+
+#[tokio::test]
+async fn offline_peer_gets_queued_offers_on_reconnect_without_auto_apply() {
+    let (mut a, b) = paired().await;
+    let b_id = b.node.device_id();
+    b.node.set_mode(a.node.device_id(), DeliveryMode::AutoSync).unwrap();
+    let TestNode { node, dir, .. } = b;
+    node.shutdown();
+    wait_for(&mut a.events, "b offline", |e| matches!(e, Event::PeerOffline { .. })).await;
+
+    for i in 0..3 {
+        a.clip.set_external(ClipPayload::Text(format!("while away {i}")));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+    }
+
+    let mut b = start_in(dir, "PC").await;
+    assert_eq!(b.node.device_id(), b_id);
+    wait_for(&mut b.events, "b back online", |e| matches!(e, Event::PeerOnline { .. })).await;
+    for _ in 0..3 {
+        wait_for(&mut b.events, "queued offer", |e| matches!(e, Event::OfferReceived(_))).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(b.clip.current(), None, "a replayed offer must never auto-apply");
+    assert_eq!(b.node.inbox().len(), 3);
+}

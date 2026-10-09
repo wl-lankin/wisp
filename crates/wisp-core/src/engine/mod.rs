@@ -1,8 +1,11 @@
+mod files;
+mod links;
 mod session;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -11,14 +14,14 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::clipboard::{write_and_mark, ClipboardBackend, EchoGuard};
-use crate::discovery::Discovery;
+use crate::discovery::{DiscoveredSet, Discovery};
 use crate::history::{History, HistoryEntry, HistoryQuery};
 use crate::identity::{Identity, Os};
 use crate::item::{ClipItem, ItemKind, Preview};
 use crate::pairing::PairingSession;
 use crate::peers::{DeliveryMode, Peer, PeerStore};
 use crate::policy::{offer_for, Inbox, InboxEntry, OfferQueue};
-use crate::transfer::{cleanup_partials, RESUME_WINDOW};
+use crate::transfer::{cleanup_partials, expand_paths, RESUME_WINDOW};
 use crate::transport::Transport;
 use crate::{CoreError, Result};
 
@@ -62,6 +65,14 @@ pub struct PeerStatus {
     pub peer: Peer,
     pub online: bool,
     pub addr: Option<SocketAddr>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NearbyDevice {
+    pub device: Uuid,
+    pub name: String,
+    pub os: Os,
+    pub addresses: Vec<SocketAddr>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -109,6 +120,13 @@ struct Inner {
     echo: Arc<Mutex<EchoGuard>>,
     pairing: Mutex<Option<PairingSession>>,
     discovery: Mutex<Option<Discovery>>,
+    save_dir: PathBuf,
+    tmp_dir: PathBuf,
+    /// Devices seen on the local network, paired or not.
+    discovered: Mutex<DiscoveredSet>,
+    /// Peers with a dial in flight, so ticks and manual adds do not stack dials.
+    dialing: Mutex<HashSet<Uuid>>,
+    closed: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -123,7 +141,8 @@ impl Node {
         let peers = PeerStore::open(&cfg.data_dir.join("peers.json"))?;
         let history = History::open(&cfg.data_dir.join("history"))?;
         std::fs::create_dir_all(&cfg.save_dir)?;
-        std::fs::create_dir_all(cfg.data_dir.join("tmp"))?;
+        let tmp_dir = cfg.data_dir.join("tmp");
+        std::fs::create_dir_all(&tmp_dir)?;
         cleanup_partials(&cfg.save_dir, RESUME_WINDOW)?;
 
         let (events, rx) = mpsc::unbounded_channel();
@@ -141,9 +160,18 @@ impl Node {
             echo: Arc::new(Mutex::new(EchoGuard::new())),
             pairing: Mutex::new(None),
             discovery: Mutex::new(None),
+            save_dir: cfg.save_dir,
+            tmp_dir,
+            discovered: Mutex::new(DiscoveredSet::new()),
+            dialing: Mutex::new(HashSet::new()),
+            closed: AtomicBool::new(false),
         });
         inner.clone().spawn_accept_loop();
         inner.clone().spawn_clipboard_loop(cfg.clipboard_poll);
+        if cfg.discovery {
+            inner.start_discovery()?;
+        }
+        inner.clone().spawn_dialer(cfg.dial_interval);
         Ok((Node { inner }, rx))
     }
 
@@ -258,7 +286,39 @@ impl Node {
         self.inner.send_to(peer, &offer_for(&item, true)).await
     }
 
+    pub async fn send_files(&self, peer: Uuid, paths: Vec<PathBuf>) -> Result<Vec<Uuid>> {
+        if self.inner.peers.lock().unwrap().get(peer).is_none() {
+            return Err(CoreError::UnknownPeer(peer.to_string()));
+        }
+        let files = expand_paths(&paths)?;
+        Ok(files
+            .into_iter()
+            .map(|(path, name)| self.inner.spawn_send(peer, path, name, false))
+            .collect())
+    }
+
+    /// Manual "add by IP" for a paired device; dials right away.
+    pub fn add_address(&self, peer: Uuid, addr: SocketAddr) -> Result<()> {
+        self.inner.peers.lock().unwrap().remember_address(peer, addr)?;
+        self.inner.clone().dial(peer);
+        Ok(())
+    }
+
+    /// Devices discovered on the local network that are not paired yet.
+    pub fn nearby(&self) -> Vec<NearbyDevice> {
+        // Lock order everywhere: peers, then conns, then discovered.
+        let peers = self.inner.peers.lock().unwrap();
+        let discovered = self.inner.discovered.lock().unwrap();
+        discovered
+            .all()
+            .into_iter()
+            .filter(|d| peers.get(d.device_id).is_none())
+            .map(|d| NearbyDevice { device: d.device_id, name: d.name.clone(), os: d.os, addresses: d.addresses.clone() })
+            .collect()
+    }
+
     pub fn shutdown(&self) {
+        self.inner.closed.store(true, Ordering::SeqCst);
         if let Some(d) = self.inner.discovery.lock().unwrap().take() {
             d.stop();
         }

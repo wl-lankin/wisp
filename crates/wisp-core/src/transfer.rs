@@ -192,7 +192,8 @@ pub async fn receive_file<S: AsyncRead + AsyncWrite + Unpin>(
         Ok(m) if m.len() <= size => m.len(),
         _ => 0,
     };
-    let mut file = tokio::fs::OpenOptions::new().create(true).write(true).open(&partial).await?;
+    // Resuming keeps the partial file; set_len below trims it to the verified offset.
+    let mut file = tokio::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&partial).await?;
     file.set_len(offset).await?;
     file.seek(std::io::SeekFrom::Start(offset)).await?;
     write_frame(stream, &Message::FileAck { transfer_id, offset }).await?;

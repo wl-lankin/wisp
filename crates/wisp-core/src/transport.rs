@@ -276,7 +276,7 @@ mod tests {
         let a = Transport::bind(&Identity::generate("A").unwrap(), localhost()).unwrap();
         let b = Transport::bind(&Identity::generate("B").unwrap(), localhost()).unwrap();
         let b_addr = b.local_addr().unwrap();
-        tokio::spawn(async move { while let Some(_) = b.accept().await {} });
+        tokio::spawn(async move { while b.accept().await.is_some() {} });
         let other = Identity::generate("Other").unwrap().fingerprint();
         assert!(a.connect(b_addr, Some(other)).await.is_err());
     }
@@ -287,7 +287,7 @@ mod tests {
         let b_id = Identity::generate("B").unwrap();
         let b = Transport::bind(&b_id, localhost()).unwrap();
         let b_addr = b.local_addr().unwrap();
-        tokio::spawn(async move { while let Some(_) = b.accept().await {} });
+        tokio::spawn(async move { while b.accept().await.is_some() {} });
         let conn = a.connect(b_addr, None).await.unwrap();
         assert_eq!(peer_fingerprint(&conn), Some(b_id.fingerprint()));
     }
@@ -298,7 +298,7 @@ mod tests {
         let b_id = Identity::generate("B").unwrap();
         let b = Transport::bind(&b_id, localhost()).unwrap();
         let b_addr = b.local_addr().unwrap();
-        tokio::spawn(async move { while let Some(_) = b.accept().await {} });
+        tokio::spawn(async move { while b.accept().await.is_some() {} });
 
         let dead: SocketAddr = "192.0.2.1:9".parse().unwrap();
         let started = std::time::Instant::now();

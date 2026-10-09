@@ -7,7 +7,7 @@ use uuid::Uuid;
 use super::{Conn, Event, Inner, OfferInfo, StreamKind};
 use crate::clipboard::{spawn_monitor, write_and_mark};
 use crate::identity::Fingerprint;
-use crate::item::{ClipItem, ClipPayload};
+use crate::item::{ClipItem, ClipPayload, Preview, MAX_CLIP_BYTES};
 use crate::pairing::{pair, PairInfo};
 use crate::peers::{DeliveryMode, Peer};
 use crate::policy::{offer_for, on_offer, InboxEntry, OfferAction};
@@ -317,7 +317,7 @@ impl Inner {
         let mut stream = tokio::io::join(recv, send);
         match read_value_max::<_, StreamKind>(&mut stream, MAX_STREAM_KIND_FRAME).await? {
             StreamKind::Pair => Err(CoreError::Pairing(format!("{peer} is already paired"))),
-            StreamKind::File => Err(CoreError::Transfer("file transfer arrives in the next task".into())),
+            StreamKind::File => self.receive_on(peer, stream).await,
         }
     }
 
@@ -352,7 +352,23 @@ impl Inner {
         if item.source != self.identity.device_id {
             return Err(CoreError::Transfer(format!("item {item_id} is not from this device")));
         }
-        self.send_to(peer, &Message::Push { item_id, payload: item.payload }).await
+        if item.payload.size() <= MAX_CLIP_BYTES {
+            return self.send_to(peer, &Message::Push { item_id, payload: item.payload }).await;
+        }
+        // Oversized items travel as a file transfer, named like the offer's file preview.
+        let name = match offer_for(&item, false) {
+            Message::Offer { preview: Preview::File { name }, .. } => name,
+            _ => format!("clipboard-{}", item.created_ms),
+        };
+        let bytes = match item.payload {
+            ClipPayload::Text(t) => t.into_bytes(),
+            ClipPayload::Html { html, .. } => html.into_bytes(),
+            ClipPayload::Image { png, .. } => png,
+        };
+        let path = self.tmp_dir.join(format!("{item_id}-{name}"));
+        tokio::fs::write(&path, bytes).await?;
+        self.spawn_send(peer, path, name, true);
+        Ok(())
     }
 
     pub(super) fn spawn_clipboard_loop(self: Arc<Self>, poll: Duration) {
