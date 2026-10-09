@@ -117,7 +117,7 @@ pub async fn update_settings(app: AppHandle, state: State<'_, AppState>, mut nex
             return Err(e);
         }
     }
-    // Without a running node (before onboarding, during a restart) the next start picks the size up.
+    // Without a running node (before onboarding, or after a failed start) the next start picks the size up.
     let live_node = if history_changed { state.engine.node().await.ok() } else { None };
     if let Some(node) = live_node.clone() {
         let cap = next.history_size as usize;
