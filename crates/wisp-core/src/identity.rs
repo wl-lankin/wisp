@@ -42,13 +42,68 @@ impl Fingerprint {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct Identity {
     pub device_id: Uuid,
     pub name: String,
     pub os: Os,
     pub cert_der: Vec<u8>,
     pub key_der: Vec<u8>,
+}
+
+impl std::fmt::Debug for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Identity")
+            .field("device_id", &self.device_id)
+            .field("name", &self.name)
+            .field("os", &self.os)
+            .field("cert_der", &self.cert_der)
+            .field("key_der", &"<redacted>")
+            .finish()
+    }
+}
+
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
+fn write_atomic_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let dir = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    create_private_dir(dir)?;
+    let file_name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+    let tmp = dir.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| {
+        let mut file = options.open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 impl Identity {
@@ -65,14 +120,13 @@ impl Identity {
     }
 
     pub fn load_or_create(path: &Path, default_name: &str) -> Result<Self> {
-        if path.exists() {
-            return Ok(serde_json::from_slice(&std::fs::read(path)?)?);
+        match std::fs::read(path) {
+            Ok(bytes) => return Ok(serde_json::from_slice(&bytes)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
         }
         let identity = Self::generate(default_name)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, serde_json::to_vec_pretty(&identity)?)?;
+        write_atomic_private(path, &serde_json::to_vec_pretty(&identity)?)?;
         Ok(identity)
     }
 
@@ -111,5 +165,45 @@ mod tests {
         assert_eq!(fp.to_hex().len(), 64);
         assert_eq!(Fingerprint::from_hex(&fp.to_hex()), Some(fp));
         assert_eq!(Fingerprint::from_hex("nothex"), None);
+    }
+
+    #[test]
+    fn corrupt_identity_file_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.json");
+        std::fs::write(&path, b"{ not json").unwrap();
+        assert!(Identity::load_or_create(&path, "X").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{ not json");
+    }
+
+    #[test]
+    fn debug_output_redacts_private_key() {
+        let id = Identity::generate("X").unwrap();
+        let shown = format!("{id:?}");
+        assert!(shown.contains("<redacted>"));
+        assert!(!shown.contains("key_der: ["));
+        assert!(!shown.contains(&hex::encode(&id.key_der)));
+    }
+
+    #[test]
+    fn load_or_create_leaves_no_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("identity.json");
+        Identity::load_or_create(&path, "X").unwrap();
+        let entries: Vec<_> = std::fs::read_dir(path.parent().unwrap()).unwrap().collect();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub").join("identity.json");
+        Identity::load_or_create(&path, "X").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let dir_mode = std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode();
+        assert_eq!(dir_mode & 0o777, 0o700);
     }
 }
