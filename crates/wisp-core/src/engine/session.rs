@@ -1,0 +1,353 @@
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use uuid::Uuid;
+
+use super::{Conn, Event, Inner, OfferInfo, StreamKind};
+use crate::clipboard::{spawn_monitor, write_and_mark};
+use crate::identity::Fingerprint;
+use crate::item::{ClipItem, ClipPayload};
+use crate::pairing::{pair, PairInfo};
+use crate::peers::{DeliveryMode, Peer};
+use crate::policy::{offer_for, on_offer, InboxEntry, OfferAction};
+use crate::protocol::{read_frame, read_value_max, write_frame, write_value, Message, PROTOCOL_VERSION};
+use crate::transport::peer_fingerprint;
+use crate::{CoreError, Result};
+
+/// Bounds a whole pairing exchange, so a silent or stalled peer cannot hold it open.
+const PAIRING_STREAM_TIMEOUT: Duration = Duration::from_secs(60);
+/// A `StreamKind` frame is a few bytes; anything larger is not a valid header.
+const MAX_STREAM_KIND_FRAME: usize = 16;
+
+fn net_err(e: impl std::fmt::Display) -> CoreError {
+    CoreError::Transport(e.to_string())
+}
+
+fn pairing_timeout() -> CoreError {
+    CoreError::Pairing("timed out".into())
+}
+
+impl Inner {
+    pub(super) fn emit(&self, event: Event) {
+        let _ = self.events.send(event);
+    }
+
+    pub(super) fn connection(&self, peer: Uuid) -> Option<quinn::Connection> {
+        self.conns.lock().unwrap().get(&peer).map(|c| c.conn.clone())
+    }
+
+    pub(super) async fn send_to(&self, peer: Uuid, msg: &Message) -> Result<()> {
+        let conn = self.connection(peer).ok_or_else(|| CoreError::UnknownPeer(peer.to_string()))?;
+        let mut stream = conn.open_uni().await.map_err(net_err)?;
+        write_frame(&mut stream, msg).await?;
+        stream.finish().map_err(net_err)?;
+        Ok(())
+    }
+
+    pub(super) async fn request_pull(&self, peer: Uuid, item_id: Uuid) -> Result<()> {
+        self.pulls.lock().unwrap().insert(item_id);
+        self.send_to(peer, &Message::Pull { item_id }).await
+    }
+
+    pub(super) fn spawn_accept_loop(self: Arc<Self>) {
+        tokio::spawn(async move {
+            while let Some(incoming) = self.transport.accept().await {
+                match incoming {
+                    Ok(conn) => {
+                        tokio::spawn(self.clone().handle_incoming(conn));
+                    }
+                    Err(e) => tracing::debug!("incoming connection failed: {e}"),
+                }
+            }
+        });
+    }
+
+    /// The transport accepts any client certificate; this lookup is the trust gate. A
+    /// connection whose fingerprint is not pinned may only run pairing.
+    async fn handle_incoming(self: Arc<Self>, conn: quinn::Connection) {
+        let Some(fp) = peer_fingerprint(&conn) else {
+            conn.close(1u32.into(), b"no certificate");
+            return;
+        };
+        let known = self
+            .peers
+            .lock()
+            .unwrap()
+            .all()
+            .iter()
+            .find(|p| p.fingerprint == fp)
+            .map(|p| p.device_id);
+        match known {
+            Some(peer) => self.register(peer, conn, false),
+            None => self.accept_pairing(conn, fp).await,
+        }
+    }
+
+    async fn accept_pairing(self: &Arc<Self>, conn: quinn::Connection, fp: Fingerprint) {
+        let code = match self.pairing.lock().unwrap().as_ref() {
+            Some(s) if s.is_open() => s.code().to_string(),
+            _ => String::new(),
+        };
+        if code.is_empty() {
+            conn.close(2u32.into(), b"not pairing");
+            return;
+        }
+        let exchange = async {
+            let (send, recv) = conn.accept_bi().await.map_err(net_err)?;
+            let mut stream = tokio::io::join(recv, send);
+            match read_value_max::<_, StreamKind>(&mut stream, MAX_STREAM_KIND_FRAME).await? {
+                StreamKind::Pair => pair(&mut stream, &code, &self.identity, Some(fp)).await,
+                StreamKind::File => Err(CoreError::Pairing("not paired yet".into())),
+            }
+        };
+        let result = tokio::time::timeout(PAIRING_STREAM_TIMEOUT, exchange)
+            .await
+            .unwrap_or_else(|_| Err(pairing_timeout()));
+        match result {
+            Ok(info) => {
+                *self.pairing.lock().unwrap() = None;
+                if let Err(e) = self.finish_pairing(info, conn, false) {
+                    self.emit(Event::PairingFailed { reason: e.to_string() });
+                }
+            }
+            Err(e) => {
+                let closed = {
+                    let mut guard = self.pairing.lock().unwrap();
+                    match guard.as_mut() {
+                        Some(s) => {
+                            s.record_failure();
+                            let closed = !s.is_open();
+                            if closed {
+                                *guard = None;
+                            }
+                            closed
+                        }
+                        None => false,
+                    }
+                };
+                let reason = if closed {
+                    "Too many wrong codes. Start pairing again.".to_string()
+                } else {
+                    e.to_string()
+                };
+                self.emit(Event::PairingFailed { reason });
+                conn.close(3u32.into(), b"pairing failed");
+            }
+        }
+    }
+
+    pub(super) async fn pair_with(self: &Arc<Self>, addr: SocketAddr, code: &str) -> Result<Peer> {
+        let conn = self.transport.connect(addr, None).await?;
+        let fp = peer_fingerprint(&conn).ok_or_else(|| CoreError::Pairing("peer sent no certificate".into()))?;
+        let exchange = async {
+            let (send, recv) = conn.open_bi().await.map_err(net_err)?;
+            let mut stream = tokio::io::join(recv, send);
+            write_value(&mut stream, &StreamKind::Pair).await?;
+            pair(&mut stream, code, &self.identity, Some(fp)).await
+        };
+        let result = tokio::time::timeout(PAIRING_STREAM_TIMEOUT, exchange)
+            .await
+            .unwrap_or_else(|_| Err(pairing_timeout()));
+        match result {
+            Ok(info) => self.finish_pairing(info, conn, true),
+            Err(e) => {
+                conn.close(3u32.into(), b"pairing failed");
+                Err(e)
+            }
+        }
+    }
+
+    fn finish_pairing(self: &Arc<Self>, info: PairInfo, conn: quinn::Connection, initiated_by_me: bool) -> Result<Peer> {
+        let peer = Peer {
+            device_id: info.device_id,
+            name: info.name,
+            os: info.os,
+            fingerprint: info.fingerprint,
+            addresses: vec![conn.remote_address()],
+            mode: DeliveryMode::Catch,
+        };
+        self.peers.lock().unwrap().upsert(peer.clone())?;
+        self.emit(Event::Paired { peer: peer.device_id, name: peer.name.clone() });
+        self.register(peer.device_id, conn, initiated_by_me);
+        Ok(peer)
+    }
+
+    /// Both devices keep the connection initiated by the lower device ID, so simultaneous
+    /// dials settle on the same single connection.
+    pub(super) fn register(self: &Arc<Self>, peer: Uuid, conn: quinn::Connection, initiated_by_me: bool) {
+        {
+            let mut conns = self.conns.lock().unwrap();
+            if let Some(existing) = conns.get(&peer) {
+                let alive = existing.conn.close_reason().is_none();
+                let new_wins = (self.identity.device_id < peer) == initiated_by_me;
+                if alive && !new_wins {
+                    conn.close(0u32.into(), b"duplicate");
+                    return;
+                }
+                if alive {
+                    existing.conn.close(0u32.into(), b"replaced");
+                }
+            }
+            conns.insert(peer, Conn { conn: conn.clone() });
+        }
+        let addr = conn.remote_address();
+        let name = {
+            let mut peers = self.peers.lock().unwrap();
+            let _ = peers.remember_address(peer, addr);
+            peers.get(peer).map(|p| p.name.clone()).unwrap_or_default()
+        };
+        self.emit(Event::PeerOnline { peer, name, addr });
+        tokio::spawn(self.clone().serve(peer, conn));
+
+        let this = self.clone();
+        tokio::spawn(async move {
+            let hello = Message::Hello {
+                device_id: this.identity.device_id,
+                name: this.identity.name.clone(),
+                os: this.identity.os,
+                version: PROTOCOL_VERSION,
+            };
+            let _ = this.send_to(peer, &hello).await;
+            let queued = this.queue.lock().unwrap().drain(peer);
+            for msg in queued {
+                if let Err(e) = this.send_to(peer, &msg).await {
+                    tracing::warn!("queued offer to {peer} failed: {e}");
+                }
+            }
+        });
+    }
+
+    async fn serve(self: Arc<Self>, peer: Uuid, conn: quinn::Connection) {
+        loop {
+            tokio::select! {
+                uni = conn.accept_uni() => match uni {
+                    Ok(recv) => {
+                        let this = self.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = this.handle_uni(peer, recv).await {
+                                tracing::warn!("message from {peer} failed: {e}");
+                            }
+                        });
+                    }
+                    Err(_) => break,
+                },
+                bi = conn.accept_bi() => match bi {
+                    Ok((send, recv)) => {
+                        let this = self.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = this.handle_bi(peer, send, recv).await {
+                                tracing::warn!("stream from {peer} failed: {e}");
+                            }
+                        });
+                    }
+                    Err(_) => break,
+                },
+            }
+        }
+        let removed = {
+            let mut conns = self.conns.lock().unwrap();
+            match conns.get(&peer) {
+                Some(c) if c.conn.stable_id() == conn.stable_id() => {
+                    conns.remove(&peer);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if removed {
+            self.emit(Event::PeerOffline { peer });
+        }
+    }
+
+    async fn handle_uni(self: &Arc<Self>, peer: Uuid, mut recv: quinn::RecvStream) -> Result<()> {
+        match read_frame(&mut recv).await? {
+            Message::Hello { name, .. } => {
+                let mut peers = self.peers.lock().unwrap();
+                if let Some(existing) = peers.get(peer).cloned() {
+                    if existing.name != name {
+                        peers.upsert(Peer { name, ..existing })?;
+                    }
+                }
+            }
+            Message::Offer { item_id, kind, size, preview, live } => {
+                let mode = self.peers.lock().unwrap().get(peer).map(|p| p.mode).unwrap_or_default();
+                match on_offer(mode, kind, live) {
+                    OfferAction::AutoPull => self.request_pull(peer, item_id).await?,
+                    OfferAction::Inbox => {
+                        let entry = InboxEntry { peer, item_id, kind, size, preview, received: Instant::now() };
+                        let info = OfferInfo::from(&entry);
+                        self.inbox.lock().unwrap().add(entry);
+                        self.emit(Event::OfferReceived(info));
+                    }
+                }
+            }
+            Message::Push { item_id, payload } => self.apply_remote(peer, item_id, payload).await,
+            Message::Pull { item_id } => self.serve_pull(peer, item_id).await?,
+            Message::Ping { nonce } => self.send_to(peer, &Message::Pong { nonce }).await?,
+            Message::Pong { .. } => {}
+            other => tracing::warn!("unexpected message on a uni stream: {other:?}"),
+        }
+        Ok(())
+    }
+
+    pub(super) async fn handle_bi(
+        self: &Arc<Self>,
+        peer: Uuid,
+        send: quinn::SendStream,
+        recv: quinn::RecvStream,
+    ) -> Result<()> {
+        let mut stream = tokio::io::join(recv, send);
+        match read_value_max::<_, StreamKind>(&mut stream, MAX_STREAM_KIND_FRAME).await? {
+            StreamKind::Pair => Err(CoreError::Pairing(format!("{peer} is already paired"))),
+            StreamKind::File => Err(CoreError::Transfer("file transfer arrives in the next task".into())),
+        }
+    }
+
+    async fn apply_remote(self: &Arc<Self>, peer: Uuid, item_id: Uuid, payload: ClipPayload) {
+        if !self.pulls.lock().unwrap().remove(&item_id) {
+            tracing::warn!("ignored an unrequested push from {peer}");
+            return;
+        }
+        let mut item = ClipItem::new(peer, payload);
+        item.id = item_id;
+        if let Err(e) = self.history.lock().unwrap().insert(&item) {
+            tracing::warn!("timeline insert failed: {e}");
+        }
+        match write_and_mark(self.clipboard.as_ref(), &self.echo, &item.payload).await {
+            Ok(()) => self.emit(Event::ClipboardApplied { item_id, from: peer }),
+            Err(_) => self.emit(Event::Error { message: "Couldn't write the clipboard. Try again.".into() }),
+        }
+    }
+
+    pub(super) async fn serve_pull(self: &Arc<Self>, peer: Uuid, item_id: Uuid) -> Result<()> {
+        let item = self.history.lock().unwrap().load(item_id)?;
+        let item = item.ok_or_else(|| CoreError::Transfer(format!("item {item_id} is no longer in the timeline")))?;
+        self.send_to(peer, &Message::Push { item_id, payload: item.payload }).await
+    }
+
+    pub(super) fn spawn_clipboard_loop(self: Arc<Self>, poll: Duration) {
+        let mut rx = spawn_monitor(self.clipboard.clone(), self.echo.clone(), poll);
+        tokio::spawn(async move {
+            while let Some(payload) = rx.recv().await {
+                self.on_local(payload).await;
+            }
+        });
+    }
+
+    async fn on_local(self: &Arc<Self>, payload: ClipPayload) {
+        let item = ClipItem::new(self.identity.device_id, payload);
+        if let Err(e) = self.history.lock().unwrap().insert(&item) {
+            tracing::warn!("timeline insert failed: {e}");
+        }
+        self.emit(Event::LocalItem { item_id: item.id });
+        let offer = offer_for(&item, true);
+        let peers: Vec<Uuid> = self.peers.lock().unwrap().all().iter().map(|p| p.device_id).collect();
+        for peer in peers {
+            let sent = self.connection(peer).is_some() && self.send_to(peer, &offer).await.is_ok();
+            if !sent {
+                self.queue.lock().unwrap().push(peer, &item);
+            }
+        }
+    }
+}

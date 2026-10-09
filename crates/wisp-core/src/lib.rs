@@ -1,5 +1,6 @@
 pub mod clipboard;
 pub mod discovery;
+pub mod engine;
 pub mod error;
 pub mod fsutil;
 pub mod history;
