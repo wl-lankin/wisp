@@ -29,6 +29,7 @@ pub struct AppState {
     pub tray_rect: Mutex<Option<windows::Rect>>,
     /// When the panel last hid because it lost focus, so the tray click that caused it closes it.
     pub panel_blurred_at: Mutex<Option<Instant>>,
+    pub panel_shown_at: Mutex<Option<Instant>>,
     /// Why the catch shortcut is not registered, shown in the UI until a later registration succeeds.
     pub hotkey_error: Mutex<Option<String>>,
     /// The last clipboard write failure, kept for a toast window that did not exist when it happened.
@@ -205,6 +206,7 @@ pub fn run() {
                 dragging: AtomicBool::new(false),
                 tray_rect: Mutex::new(None),
                 panel_blurred_at: Mutex::new(None),
+                panel_shown_at: Mutex::new(None),
                 hotkey_error: Mutex::new(None),
                 clipboard_error: Mutex::new(ClipboardErrorLog::default()),
                 hotkey_busy: AtomicBool::new(false),

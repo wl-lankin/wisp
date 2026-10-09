@@ -210,7 +210,7 @@ const themes: { id: Theme; name: string }[] = [
 </script>
 
 <template>
-  <main class="flex h-screen flex-col gap-6 overflow-y-auto px-6 pb-6 pt-12 text-[13px]" tabindex="-1">
+  <main class="mt-9 flex h-[calc(100vh-2.25rem)] flex-col gap-6 overflow-y-auto px-6 pb-6 pt-3 text-[13px]" tabindex="-1">
     <WindowBar />
     <header data-tauri-drag-region class="flex items-baseline justify-between">
       <h1 data-tauri-drag-region class="accent-text text-xl font-semibold tracking-tight">Settings</h1>
