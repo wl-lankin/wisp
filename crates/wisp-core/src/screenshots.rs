@@ -1,10 +1,12 @@
 //! Watches a folder for new screenshots and turns them into image payloads.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use image::{ImageFormat, ImageReader};
 use notify::event::{ModifyKind, RenameMode};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
@@ -48,10 +50,12 @@ pub async fn wait_until_stable(path: &Path, interval: Duration, max: Duration) -
     }
 }
 
-/// Remembers which files were already offered in this session.
+/// Remembers which files were already offered in this session, by path and
+/// modification time and by content, so a renamed or copied file is not offered again.
 #[derive(Debug, Default)]
 pub struct SeenFiles {
     seen: HashMap<PathBuf, SystemTime>,
+    contents: HashSet<[u8; 32]>,
 }
 
 impl SeenFiles {
@@ -69,23 +73,34 @@ impl SeenFiles {
             }
         }
     }
+
+    /// True the first time these file contents (by blake3 hash) are seen.
+    pub fn first_content(&mut self, hash: [u8; 32]) -> bool {
+        self.contents.insert(hash)
+    }
 }
 
-/// Decodes an image file and returns it as a PNG payload.
-pub fn image_payload(bytes: &[u8]) -> Result<ClipPayload> {
-    let format = image::guess_format(bytes).map_err(|e| CoreError::Invalid(format!("image: {e}")))?;
-    let img = image::load_from_memory_with_format(bytes, format)
-        .map_err(|e| CoreError::Invalid(format!("image: {e}")))?;
-    let (width, height) = (img.width(), img.height());
-    let png = if format == image::ImageFormat::Png {
-        bytes.to_vec()
-    } else {
-        let mut out = std::io::Cursor::new(Vec::new());
-        img.write_to(&mut out, image::ImageFormat::Png)
-            .map_err(|e| CoreError::Invalid(format!("image: {e}")))?;
-        out.into_inner()
-    };
-    Ok(ClipPayload::Image { png, width, height })
+/// Turns an image file into a PNG payload. A PNG is kept as-is (only its header is read);
+/// anything else is decoded and re-encoded. CPU heavy: call it off the async runtime.
+pub fn image_payload(bytes: Vec<u8>) -> Result<ClipPayload> {
+    let reader = ImageReader::new(Cursor::new(&bytes)).with_guessed_format()?;
+    match reader.format() {
+        Some(ImageFormat::Png) => {
+            let (width, height) = reader.into_dimensions().map_err(image_error)?;
+            Ok(ClipPayload::Image { png: bytes, width, height })
+        }
+        Some(_) => {
+            let img = reader.decode().map_err(image_error)?;
+            let mut out = Cursor::new(Vec::new());
+            img.write_to(&mut out, ImageFormat::Png).map_err(image_error)?;
+            Ok(ClipPayload::Image { png: out.into_inner(), width: img.width(), height: img.height() })
+        }
+        None => Err(CoreError::Invalid("image: unknown format".into())),
+    }
+}
+
+fn image_error(e: image::ImageError) -> CoreError {
+    CoreError::Invalid(format!("image: {e}"))
 }
 
 /// Watches one folder; dropping it stops watching.
@@ -145,7 +160,22 @@ async fn process(
     on_shot: Arc<dyn Fn(ClipPayload) + Send + Sync>,
 ) {
     let mut seen = SeenFiles::new();
-    while let Some(path) = rx.recv().await {
+    // A path already waiting is not queued again. It leaves the set when its turn comes,
+    // so events arriving while it is processed queue it once more.
+    let mut queue = VecDeque::new();
+    let mut pending = HashSet::new();
+    loop {
+        if queue.is_empty() {
+            match rx.recv().await {
+                Some(path) => enqueue(&mut queue, &mut pending, path),
+                None => return,
+            }
+        }
+        while let Ok(path) = rx.try_recv() {
+            enqueue(&mut queue, &mut pending, path);
+        }
+        let Some(path) = queue.pop_front() else { continue };
+        pending.remove(&path);
         match screenshot_payload(&path, is_screenshot, &mut seen).await {
             Ok(Some(payload)) => on_shot(payload),
             Ok(None) => {}
@@ -154,21 +184,73 @@ async fn process(
     }
 }
 
+fn enqueue(queue: &mut VecDeque<PathBuf>, pending: &mut HashSet<PathBuf>, path: PathBuf) {
+    if pending.insert(path.clone()) {
+        queue.push_back(path);
+    }
+}
+
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T> {
+    tokio::task::spawn_blocking(f).await.map_err(|e| CoreError::Invalid(format!("worker: {e}")))
+}
+
 async fn screenshot_payload(
     path: &Path,
     is_screenshot: fn(&Path) -> bool,
     seen: &mut SeenFiles,
 ) -> Result<Option<ClipPayload>> {
-    wait_until_stable(path, STABLE_INTERVAL, STABLE_MAX).await?;
+    // Cheap check first; an attribute set late arrives as a later metadata event.
     if !is_screenshot(path) {
         return Ok(None);
     }
+    wait_until_stable(path, STABLE_INTERVAL, STABLE_MAX).await?;
     let modified = tokio::fs::metadata(path).await?.modified()?;
     if !seen.first_time(path, modified) {
         return Ok(None);
     }
     let bytes = tokio::fs::read(path).await?;
-    image_payload(&bytes).map(Some)
+    let (bytes, hash) = blocking(move || {
+        let hash = *blake3::hash(&bytes).as_bytes();
+        (bytes, hash)
+    })
+    .await?;
+    if !seen.first_content(hash) {
+        return Ok(None);
+    }
+    let bytes = if is_heic(path) { heic_to_png(path.to_path_buf()).await? } else { bytes };
+    blocking(move || image_payload(bytes)).await?.map(Some)
+}
+
+fn is_heic(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("heic"))
+}
+
+/// Converts a HEIC file to PNG bytes with the system `sips` tool.
+#[cfg(target_os = "macos")]
+async fn heic_to_png(src: PathBuf) -> Result<Vec<u8>> {
+    blocking(move || {
+        let out = std::env::temp_dir().join(format!("wisp-heic-{}.png", uuid::Uuid::new_v4()));
+        let result = match std::process::Command::new("sips")
+            .args(["-s", "format", "png"])
+            .arg(&src)
+            .arg("--out")
+            .arg(&out)
+            .output()
+        {
+            Ok(o) if o.status.success() => std::fs::read(&out).map_err(CoreError::from),
+            Ok(o) => Err(CoreError::Invalid(format!("sips failed: {}", String::from_utf8_lossy(&o.stderr).trim()))),
+            Err(e) => Err(CoreError::from(e)),
+        };
+        let _ = std::fs::remove_file(&out);
+        result
+    })
+    .await?
+}
+
+/// HEIC needs the macOS `sips` tool; elsewhere such files are skipped.
+#[cfg(not(target_os = "macos"))]
+async fn heic_to_png(src: PathBuf) -> Result<Vec<u8>> {
+    Err(CoreError::Invalid(format!("{}: HEIC is only supported on macOS", src.display())))
 }
 
 /// True when macOS marked the file as a screen capture.
@@ -271,12 +353,15 @@ mod tests {
         assert!(!seen.first_time(path, t));
         assert!(seen.first_time(path, t + Duration::from_secs(1)));
         assert!(seen.first_time(Path::new("/x/b.png"), t));
+        assert!(seen.first_content([1; 32]));
+        assert!(!seen.first_content([1; 32]));
+        assert!(seen.first_content([2; 32]));
     }
 
     #[test]
     fn jpeg_becomes_a_png_payload() {
         let jpeg = encoded(30, 20, image::ImageFormat::Jpeg);
-        match image_payload(&jpeg).unwrap() {
+        match image_payload(jpeg).unwrap() {
             ClipPayload::Image { png, width, height } => {
                 assert_eq!((width, height), (30, 20));
                 assert_eq!(image::guess_format(&png).unwrap(), image::ImageFormat::Png);
@@ -288,8 +373,8 @@ mod tests {
     #[test]
     fn png_is_kept_as_is() {
         let png = encoded(12, 7, image::ImageFormat::Png);
-        assert_eq!(image_payload(&png).unwrap(), ClipPayload::Image { png: png.clone(), width: 12, height: 7 });
-        assert!(image_payload(b"not an image").is_err());
+        assert_eq!(image_payload(png.clone()).unwrap(), ClipPayload::Image { png, width: 12, height: 7 });
+        assert!(image_payload(b"not an image".to_vec()).is_err());
     }
 
     fn collecting() -> (Arc<dyn Fn(ClipPayload) + Send + Sync>, mpsc::UnboundedReceiver<ClipPayload>) {
@@ -338,6 +423,33 @@ mod tests {
         (&f).write_all(&bytes).unwrap();
         f.set_modified(modified).unwrap();
         drop(f);
+        assert_quiet(&mut rx).await;
+    }
+
+    #[tokio::test]
+    async fn a_renamed_screenshot_is_not_offered_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (on_shot, mut rx) = collecting();
+        let _watcher = ScreenshotWatcher::start(dir.path().to_path_buf(), |_| true, on_shot).unwrap();
+        let first = dir.path().join("Screenshot.png");
+        std::fs::write(&first, encoded(8, 6, image::ImageFormat::Png)).unwrap();
+        next(&mut rx).await;
+        std::fs::rename(&first, dir.path().join("Renamed.png")).unwrap();
+        assert_quiet(&mut rx).await;
+    }
+
+    #[tokio::test]
+    async fn a_hidden_temp_file_renamed_into_place_is_offered_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (on_shot, mut rx) = collecting();
+        let _watcher = ScreenshotWatcher::start(dir.path().to_path_buf(), |_| true, on_shot).unwrap();
+        let temp = dir.path().join(".Screenshot x.png");
+        std::fs::write(&temp, encoded(10, 5, image::ImageFormat::Png)).unwrap();
+        std::fs::rename(&temp, dir.path().join("Screenshot x.png")).unwrap();
+        match next(&mut rx).await {
+            ClipPayload::Image { width, height, .. } => assert_eq!((width, height), (10, 5)),
+            other => panic!("unexpected {other:?}"),
+        }
         assert_quiet(&mut rx).await;
     }
 
