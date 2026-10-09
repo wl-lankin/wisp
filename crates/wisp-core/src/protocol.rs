@@ -38,8 +38,12 @@ pub async fn write_value<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, value: 
 }
 
 pub async fn read_value<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) -> Result<T> {
+    read_value_max(r, MAX_FRAME).await
+}
+
+pub async fn read_value_max<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R, max: usize) -> Result<T> {
     let len = r.read_u32().await? as usize;
-    if len > MAX_FRAME {
+    if len > max {
         return Err(CoreError::Frame(format!("frame of {len} bytes exceeds limit")));
     }
     let mut buf = vec![0u8; len];
