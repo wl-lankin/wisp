@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
     "test": "vitest run",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "check-versions": "node scripts/versions.mjs check",
+    "set-version": "node scripts/versions.mjs set"
   },
   "dependencies": {
     "@fontsource-variable/geist": "^5.1.0",
@@ -19,6 +21,7 @@
   "devDependencies": {
     "@tailwindcss/vite": "^4.1.0",
     "@tauri-apps/cli": "^2.8.0",
+    "@types/node": "^24.19.2",
     "@vitejs/plugin-vue": "^6.0.0",
     "@vue/test-utils": "^2.4.0",
     "jsdom": "^26.0.0",
