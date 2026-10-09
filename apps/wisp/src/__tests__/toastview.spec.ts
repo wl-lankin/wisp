@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
 import { reactive, ref } from 'vue'
-import { initialState } from '../lib/store'
+import { initialState, pushNotice, reduce } from '../lib/store'
 import type { Offer } from '../lib/types'
 
 const state = reactive(initialState())
@@ -23,7 +23,7 @@ describe('ToastView', () => {
   beforeEach(() => {
     vi.useFakeTimers()
     vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} unobserve() {} })
-    Object.assign(state, { ready: true, platform: 'windows', peers: [], inbox: [offer('1')] })
+    Object.assign(state, { ready: true, platform: 'windows', peers: [], inbox: [offer('1')], notices: [], offerSeq: 0 })
   })
   afterEach(() => {
     vi.useRealTimers()
@@ -68,6 +68,42 @@ describe('ToastView', () => {
     expect(api.hideWindow).toHaveBeenCalledTimes(1)
     await vi.advanceTimersByTimeAsync(2000)
     expect(api.hideWindow).toHaveBeenCalledTimes(2)
+    w.unmount()
+  })
+
+  it('comes back for a repeated offer that is already in the inbox', async () => {
+    const { api, w } = await setup()
+    await vi.advanceTimersByTimeAsync(9000)
+    expect(api.hideWindow).toHaveBeenCalledTimes(1)
+    reduce(state, { type: 'offerReceived', ...offer('1') })
+    await flushPromises()
+    expect((w.element as HTMLElement).style.opacity).toBe('1')
+    await vi.advanceTimersByTimeAsync(7000)
+    expect(api.hideWindow).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(api.hideWindow).toHaveBeenCalledTimes(2)
+    w.unmount()
+  })
+
+  it('shows an engine error and stays until it is dismissed', async () => {
+    const { api, w } = await setup()
+    state.inbox = []
+    pushNotice(state, 'error', "Couldn't write the clipboard. Try again.")
+    await flushPromises()
+    expect(w.text()).toContain("Couldn't write the clipboard. Try again.")
+    await vi.advanceTimersByTimeAsync(30000)
+    expect(api.hideWindow).not.toHaveBeenCalled()
+    await w.find('[data-testid="toast-error"] button').trigger('click')
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(w.text()).not.toContain("Couldn't write the clipboard")
+    expect(api.hideWindow).toHaveBeenCalledTimes(1)
+    w.unmount()
+  })
+
+  it('shows the shortcut with Mac names on macOS', async () => {
+    state.platform = 'macos'
+    const { w } = await setup()
+    expect(w.text()).toContain('Ctrl+Option+V')
     w.unmount()
   })
 })

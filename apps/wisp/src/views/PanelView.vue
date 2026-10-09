@@ -26,7 +26,8 @@ const selectedPeer = computed(() => state.peers.find((p) => p.peer.deviceId === 
 const pendingByPeer = computed(() =>
   state.inbox.reduce<Record<string, number>>((acc, o) => ((acc[o.peer] = (acc[o.peer] ?? 0) + 1), acc), {}),
 )
-const activeTransfers = computed(() => Object.values(state.transfers).filter((t) => t.status === 'active' || t.status === 'paused'))
+/** Running transfers, plus failed ones that stay with their reason until dismissed. */
+const shownTransfers = computed(() => Object.values(state.transfers).filter((t) => t.status !== 'done'))
 
 function nameOf(id: string): string {
   if (id === state.deviceId) return 'This device'
@@ -74,7 +75,14 @@ function toggleMode() {
 }
 
 function catchOffer(itemId: string) {
-  void run(() => api.catchItem(itemId))
+  void run(async () => {
+    await api.catchItem(itemId)
+    state.inbox = state.inbox.filter((x) => x.itemId !== itemId)
+  })
+}
+
+function dismissTransfer(id: string) {
+  delete state.transfers[id]
 }
 
 function dismissOffer(itemId: string) {
@@ -227,8 +235,19 @@ onUnmounted(() => {
         </ItemCard>
       </section>
 
-      <section v-if="activeTransfers.length" class="flex flex-col gap-2">
-        <TransferRow v-for="t in activeTransfers" :key="t.id" :transfer="t" :peer-name="nameOf(t.peer)" />
+      <section v-if="shownTransfers.length" class="flex flex-col gap-2">
+        <div v-for="t in shownTransfers" :key="t.id" class="flex items-start gap-2">
+          <TransferRow class="min-w-0 flex-1" :transfer="t" :peer-name="nameOf(t.peer)" />
+          <button
+            v-if="t.status === 'failed'"
+            data-testid="dismiss-transfer"
+            class="hoverable text-[var(--muted)] hover:text-[var(--text)]"
+            title="Dismiss"
+            @click="dismissTransfer(t.id)"
+          >
+            <IconGlyph name="close" :size="12" />
+          </button>
+        </div>
       </section>
 
       <section class="flex min-h-0 flex-1 flex-col gap-2">

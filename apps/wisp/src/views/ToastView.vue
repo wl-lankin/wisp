@@ -5,7 +5,8 @@ import PreviewBody from '../components/PreviewBody.vue'
 import { api } from '../lib/api'
 import { useAppStore } from '../lib/appStore'
 import { formatAge } from '../lib/format'
-import { pushNotice } from '../lib/store'
+import { displayCombo } from '../lib/hotkeys'
+import { dismissNotice, pushNotice } from '../lib/store'
 import { groupOffers, shouldHide } from '../lib/toasts'
 
 const { state, settings } = useAppStore()
@@ -16,10 +17,11 @@ const lastChange = ref(Date.now())
 const working = ref<string | null>(null)
 
 const isMac = computed(() => state.platform === 'macos')
-const hotkeyHint = computed(() => {
-  const combo = settings.value?.hotkey ?? 'Ctrl+Alt+V'
-  return isMac.value ? combo.replace('Alt', 'Option') : combo
-})
+const hotkeyHint = computed(() => displayCombo(settings.value?.hotkey ?? 'Ctrl+Alt+V', isMac.value))
+
+/** Errors from before the toast last came back are old news and stay in the other windows. */
+let errorsAfter = 0
+const latestError = computed(() => [...state.notices].reverse().find((n) => n.kind === 'error' && n.id > errorsAfter) ?? null)
 
 const groups = computed(() =>
   groupOffers(state.inbox, (id) => state.peers.find((p) => p.peer.deviceId === id)?.peer.name ?? 'A device'),
@@ -28,6 +30,18 @@ const groups = computed(() =>
 const FADE_MS = 200
 let fadeTimer: ReturnType<typeof setTimeout> | undefined
 let lastHeight = 0
+
+// Every offer brings the toast back, even a repeat of one it already shows.
+watch(
+  () => state.offerSeq,
+  () => {
+    if (hidden.value) errorsAfter = state.notices.reduce((max, n) => Math.max(max, n.id), errorsAfter)
+    clearTimeout(fadeTimer)
+    hidden.value = false
+    hovering.value = false
+    lastChange.value = Date.now()
+  },
+)
 
 watch(
   () => state.inbox.map((o) => o.itemId).join(','),
@@ -53,6 +67,11 @@ function hideSelf() {
   hovering.value = false
   hidden.value = true
   fadeTimer = setTimeout(() => void api.hideWindow('toast'), FADE_MS)
+}
+
+function closeError(id: number) {
+  dismissNotice(state, id)
+  lastChange.value = Date.now()
 }
 
 function leave() {
@@ -97,7 +116,8 @@ onMounted(() => {
   window.addEventListener('blur', releaseHover)
   document.addEventListener('visibilitychange', onVisibility)
   timer = setInterval(() => {
-    if (state.ready && !hidden.value && shouldHide(Date.now(), lastChange.value, hovering.value, state.inbox.length)) {
+    // An error stays up until it is read and dismissed.
+    if (state.ready && !hidden.value && !latestError.value && shouldHide(Date.now(), lastChange.value, hovering.value, state.inbox.length)) {
       hideSelf()
     }
   }, 500)
@@ -124,6 +144,17 @@ onUnmounted(() => {
       @mouseenter="hovering = true"
       @mouseleave="leave"
     >
+    <div
+      v-if="latestError"
+      data-testid="toast-error"
+      role="alert"
+      class="glass flex items-start justify-between gap-2 px-3 py-2 text-[12px] text-[var(--danger)]"
+    >
+      <span>{{ latestError.text }}</span>
+      <button title="Dismiss" class="hoverable text-[var(--muted)] hover:text-[var(--text)]" @click="closeError(latestError.id)">
+        <IconGlyph name="close" :size="12" />
+      </button>
+    </div>
     <TransitionGroup name="toast">
       <article v-for="g in groups" :key="g.peer" class="glass p-3 shadow-2xl">
         <header class="mb-2 flex items-center justify-between text-[11px]">

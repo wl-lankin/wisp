@@ -133,4 +133,28 @@ describe('reduce', () => {
     applySnapshot(s, { ...snap(), hotkeyError: null })
     expect(s.notices).toHaveLength(1)
   })
+
+  it('reloads when another window changed the inbox or the peers', () => {
+    const s = initialState()
+    expect(reduce(s, { type: 'inboxChanged' })).toBe(true)
+    expect(reduce(s, { type: 'peersChanged' })).toBe(true)
+  })
+
+  it('counts every offer, even one already in the inbox', () => {
+    const s = initialState()
+    applySnapshot(s, snap())
+    reduce(s, { type: 'offerReceived', ...offer('a') })
+    reduce(s, { type: 'offerReceived', ...offer('a') })
+    expect(s.offerSeq).toBe(2)
+  })
+
+  it('reports a failed transfer as an error', () => {
+    const s = initialState()
+    reduce(s, { type: 'transferProgress', transferId: 't', peer: mac, name: 'a.pdf', done: 1, total: 2, outgoing: true })
+    reduce(s, { type: 'transferFailed', transferId: 't', peer: mac, reason: 'The other device went away' })
+    expect(s.notices).toHaveLength(1)
+    expect(s.notices[0].kind).toBe('error')
+    expect(s.notices[0].text).toContain('a.pdf')
+    expect(s.notices[0].text).toContain('The other device went away')
+  })
 })

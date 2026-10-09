@@ -6,7 +6,13 @@ import { initialState } from '../lib/store'
 const state = reactive(initialState())
 vi.mock('../lib/appStore', () => ({ useAppStore: () => ({ state, settings: ref(null), resync: vi.fn() }) }))
 vi.mock('../lib/api', () => ({
-  api: { history: vi.fn().mockResolvedValue([]), openWindow: vi.fn(), hideWindow: vi.fn(), sendFiles: vi.fn().mockResolvedValue([]) },
+  api: {
+    history: vi.fn().mockResolvedValue([]),
+    openWindow: vi.fn(),
+    hideWindow: vi.fn(),
+    sendFiles: vi.fn().mockResolvedValue([]),
+    catchItem: vi.fn().mockResolvedValue(undefined),
+  },
 }))
 const dragHandlers: Array<(e: { payload: unknown }) => void> = []
 vi.mock('@tauri-apps/api/webview', () => ({
@@ -70,6 +76,45 @@ describe('PanelView', () => {
     await flushPromises()
     expect(api.sendFiles).toHaveBeenCalledTimes(1)
     expect(state.notices.some((n) => n.text.includes('off is offline'))).toBe(true)
+    w.unmount()
+  })
+
+  const mac = { peer: { deviceId: 'm', name: 'MacBook', os: 'MacOs', fingerprint: 'x', addresses: [], mode: 'Catch' }, online: true, addr: null }
+
+  it('drops a caught offer from the list right away', async () => {
+    const { api } = await import('../lib/api')
+    Object.assign(state, {
+      ready: true,
+      peers: [mac],
+      transfers: {},
+      inbox: [{ peer: 'm', itemId: 'i1', kind: 'Text', size: 5, preview: { kind: 'text', text: 'hello', smart: { type: 'plain' } }, ageMs: 0 }],
+    })
+    const { default: PanelView } = await import('../views/PanelView.vue')
+    const w = mount(PanelView)
+    await flushPromises()
+    await w.findAll('button').filter((b) => b.text() === 'Catch')[0].trigger('click')
+    await flushPromises()
+    expect(api.catchItem).toHaveBeenCalledWith('i1')
+    expect(state.inbox).toEqual([])
+    w.unmount()
+  })
+
+  it('keeps a failed transfer with its reason until it is dismissed', async () => {
+    Object.assign(state, {
+      ready: true,
+      peers: [mac],
+      inbox: [],
+      notices: [],
+      transfers: { t: { id: 't', peer: 'm', name: 'a.pdf', done: 1, total: 2, outgoing: true, status: 'failed', reason: 'MacBook went offline' } },
+    })
+    const { default: PanelView } = await import('../views/PanelView.vue')
+    const w = mount(PanelView)
+    await flushPromises()
+    expect(w.text()).toContain('MacBook went offline')
+    await w.find('[data-testid="dismiss-transfer"]').trigger('click')
+    await flushPromises()
+    expect(state.transfers).toEqual({})
+    expect(w.text()).not.toContain('MacBook went offline')
     w.unmount()
   })
 })

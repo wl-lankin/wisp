@@ -90,3 +90,5 @@ export type EngineEvent =
   | { type: 'transferDone'; transferId: string; peer: string; path: string | null }
   | { type: 'transferFailed'; transferId: string; peer: string; reason: string }
   | { type: 'error'; message: string }
+  | { type: 'inboxChanged' }
+  | { type: 'peersChanged' }

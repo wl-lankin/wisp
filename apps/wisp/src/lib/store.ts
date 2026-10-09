@@ -32,6 +32,8 @@ export interface State {
   identityWarnings: string[]
   hotkeyErrorShown: string
   historyVersion: number
+  /** Bumped on every offer, including repeats of one already in the inbox, so the toast can wake up. */
+  offerSeq: number
 }
 
 const MAX_NOTICES = 5
@@ -52,6 +54,7 @@ export function initialState(): State {
     identityWarnings: [],
     hotkeyErrorShown: '',
     historyVersion: 0,
+    offerSeq: 0,
   }
 }
 
@@ -142,6 +145,7 @@ export function reduce(s: State, e: EngineEvent): boolean {
     case 'offerReceived': {
       const { type: _type, ...offer } = e
       s.inbox = [offer, ...s.inbox.filter((o) => o.itemId !== offer.itemId)]
+      s.offerSeq++
       return false
     }
     case 'clipboardApplied':
@@ -160,12 +164,20 @@ export function reduce(s: State, e: EngineEvent): boolean {
     case 'transferDone':
       Object.assign(transfer(s, e.transferId, e.peer), { status: 'done', path: e.path })
       return false
-    case 'transferFailed':
-      Object.assign(transfer(s, e.transferId, e.peer), { status: 'failed', reason: e.reason })
+    case 'transferFailed': {
+      const t = transfer(s, e.transferId, e.peer)
+      if (t.status === 'failed') return false
+      Object.assign(t, { status: 'failed', reason: e.reason })
+      notify(s, 'error', `${t.name || 'A file'} did not get through. ${e.reason}`)
       return false
+    }
     case 'error':
       notify(s, 'error', e.message)
       return false
+    case 'inboxChanged':
+    case 'peersChanged':
+      // Another window caught, dismissed, forgot or switched something; reload to match it.
+      return true
   }
 }
 

@@ -5,7 +5,8 @@ import { api } from '../lib/api'
 import { useAppStore } from '../lib/appStore'
 import { comboFromEvent, comboProblem, displayCombo } from '../lib/hotkeys'
 import { osLabel } from '../lib/format'
-import { pushNotice } from '../lib/store'
+import IconGlyph from '../components/IconGlyph.vue'
+import { dismissNotice, pushNotice } from '../lib/store'
 import type { AppSettings, DeliveryMode, Theme } from '../lib/types'
 
 const { state, settings, resync } = useAppStore()
@@ -43,7 +44,16 @@ async function startRecording() {
   recorder.value?.focus()
 }
 
-async function save(patch: Partial<AppSettings>) {
+/** Saves run one after another; each patches the settings as the previous save left them. */
+let saving: Promise<void> = Promise.resolve()
+
+function save(patch: Partial<AppSettings>): Promise<void> {
+  const next = saving.then(() => saveNow(patch))
+  saving = next
+  return next
+}
+
+async function saveNow(patch: Partial<AppSettings>) {
   if (!settings.value) return
   try {
     settings.value = await api.updateSettings({ ...settings.value, ...patch })
@@ -133,7 +143,10 @@ const themes: { id: Theme; name: string }[] = [
     </header>
 
     <ul v-if="state.notices.length" class="flex flex-col gap-1">
-      <li v-for="n in state.notices" :key="n.id" class="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2" :class="n.kind === 'error' ? 'text-[var(--danger)]' : 'text-[var(--muted)]'">{{ n.text }}</li>
+      <li v-for="n in state.notices" :key="n.id" class="flex items-start justify-between gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2" :class="n.kind === 'error' ? 'text-[var(--danger)]' : 'text-[var(--muted)]'">
+        <span>{{ n.text }}</span>
+        <button data-testid="dismiss-notice" class="hoverable text-[var(--muted)] hover:text-[var(--text)]" title="Dismiss" @click="dismissNotice(state, n.id)"><IconGlyph name="close" :size="12" /></button>
+      </li>
     </ul>
 
     <section class="flex flex-col gap-2">
