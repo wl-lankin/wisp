@@ -230,7 +230,10 @@ impl Node {
     }
 
     pub fn forget(&self, peer: Uuid) -> Result<()> {
-        self.inner.peers.lock().unwrap().remove(peer)?;
+        // Held across both steps, so `register` sees either the peer with its connection or
+        // neither.
+        let mut peers = self.inner.peers.lock().unwrap();
+        peers.remove(peer)?;
         if let Some(c) = self.inner.conns.lock().unwrap().remove(&peer) {
             c.conn.close(0u32.into(), b"forgotten");
         }
@@ -347,6 +350,7 @@ mod tests {
 
     use super::*;
     use crate::clipboard::MemoryClipboard;
+    use crate::identity::Fingerprint;
     use crate::item::{ClipPayload, MAX_CLIP_BYTES};
 
     async fn start_node(dir: &std::path::Path) -> (Node, Arc<MemoryClipboard>, mpsc::UnboundedReceiver<Event>) {
@@ -385,6 +389,55 @@ mod tests {
 
     fn tmp_files(dir: &std::path::Path) -> Vec<PathBuf> {
         std::fs::read_dir(dir.join("data").join("tmp")).unwrap().map(|e| e.unwrap().path()).collect()
+    }
+
+    /// A connection from `node` to a fresh device that is not paired with it. The returned
+    /// server-side handle keeps the connection open.
+    async fn raw_connection(node: &Node) -> (quinn::Connection, quinn::Connection, Identity) {
+        let other = Identity::generate("Other").unwrap();
+        let transport = Transport::bind(&other, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = transport.local_addr().unwrap();
+        let accept = tokio::spawn(async move { transport.accept().await });
+        let conn = node.inner.transport.connect(addr, None).await.unwrap();
+        let server_side = accept.await.unwrap().unwrap().unwrap();
+        (conn, server_side, other)
+    }
+
+    fn pinned(id: &Identity, fingerprint: Fingerprint) -> Peer {
+        Peer {
+            device_id: id.device_id,
+            name: id.name.clone(),
+            os: id.os,
+            fingerprint,
+            addresses: vec![],
+            mode: DeliveryMode::Catch,
+        }
+    }
+
+    #[tokio::test]
+    async fn register_refuses_connections_that_are_not_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, _clip) = node(dir.path()).await;
+
+        // Forgotten while the dial was in flight: no longer in the store.
+        let (conn, _keep, other) = raw_connection(&node).await;
+        node.inner.register(other.device_id, conn.clone(), true);
+        assert!(node.inner.connection(other.device_id).is_none());
+        assert!(conn.close_reason().is_some());
+
+        // Re-paired meanwhile with a different certificate.
+        let (conn, _keep, other) = raw_connection(&node).await;
+        node.inner.peers.lock().unwrap().upsert(pinned(&other, Fingerprint([9; 32]))).unwrap();
+        node.inner.register(other.device_id, conn.clone(), true);
+        assert!(node.inner.connection(other.device_id).is_none());
+        assert!(conn.close_reason().is_some());
+
+        // Pinned with this very certificate.
+        let (conn, _keep, other) = raw_connection(&node).await;
+        node.inner.peers.lock().unwrap().upsert(pinned(&other, other.fingerprint())).unwrap();
+        node.inner.register(other.device_id, conn.clone(), true);
+        assert!(node.inner.connection(other.device_id).is_some());
+        node.shutdown();
     }
 
     #[tokio::test]

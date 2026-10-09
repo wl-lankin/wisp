@@ -257,3 +257,32 @@ async fn offline_peer_gets_queued_offers_on_reconnect_without_auto_apply() {
     assert_eq!(b.clip.current(), None, "a replayed offer must never auto-apply");
     assert_eq!(b.node.inbox().len(), 3);
 }
+
+#[tokio::test]
+async fn a_forgotten_peer_redialing_does_not_use_up_pairing_attempts() {
+    let (mut a, b) = paired().await;
+    a.node.forget(b.node.device_id()).unwrap();
+    // b still pins a and keeps redialing it every dial interval.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let code = a.node.begin_pairing();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let c = start("Laptop").await;
+    let wrong = if code == "000000" { "111111" } else { "000000" };
+    for _ in 0..2 {
+        assert!(c.node.pair_with(a.addr(), wrong).await.is_err());
+    }
+    c.node.pair_with(a.addr(), &code).await.expect("the right code must still pair");
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let ids: Vec<uuid::Uuid> = a.node.peers().iter().map(|p| p.peer.device_id).collect();
+    assert_eq!(ids, vec![c.node.device_id()], "the forgotten peer came back");
+    let mut failures = 0;
+    while let Ok(e) = a.events.try_recv() {
+        if matches!(e, Event::PairingFailed { .. }) {
+            failures += 1;
+        }
+    }
+    assert_eq!(failures, 2, "only the two wrong codes may fail");
+    drop(b);
+}

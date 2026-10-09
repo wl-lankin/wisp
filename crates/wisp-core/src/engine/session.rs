@@ -20,6 +20,8 @@ use crate::{CoreError, Result};
 const PAIRING_STREAM_TIMEOUT: Duration = Duration::from_secs(60);
 /// A `StreamKind` frame is a few bytes; anything larger is not a valid header.
 const MAX_STREAM_KIND_FRAME: usize = 16;
+/// How long an unknown device has to open its pairing stream before it is dropped.
+const STREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn net_err(e: impl std::fmt::Display) -> CoreError {
     CoreError::Transport(e.to_string())
@@ -90,6 +92,22 @@ impl Inner {
     }
 
     async fn accept_pairing(self: &Arc<Self>, conn: quinn::Connection, fp: Fingerprint) {
+        // Only a connection that opens a pairing stream is a pairing attempt. A device that
+        // still pins this one (for example after `forget`) redials without ever doing so, and
+        // must neither use up attempts nor show a pairing failure.
+        let header = async {
+            let (send, recv) = conn.accept_bi().await.map_err(net_err)?;
+            let mut stream = tokio::io::join(recv, send);
+            let kind = read_value_max::<_, StreamKind>(&mut stream, MAX_STREAM_KIND_FRAME).await?;
+            Ok::<_, CoreError>((kind, stream))
+        };
+        let mut stream = match tokio::time::timeout(STREAM_HEADER_TIMEOUT, header).await {
+            Ok(Ok((StreamKind::Pair, stream))) => stream,
+            _ => {
+                conn.close(2u32.into(), b"not paired");
+                return;
+            }
+        };
         // The attempt is counted before the exchange starts, so parallel connections cannot
         // run more exchanges than the session allows.
         let attempt = self.pairing.lock().unwrap().as_mut().and_then(|s| s.try_begin_attempt());
@@ -97,14 +115,7 @@ impl Inner {
             conn.close(2u32.into(), b"not pairing");
             return;
         };
-        let exchange = async {
-            let (send, recv) = conn.accept_bi().await.map_err(net_err)?;
-            let mut stream = tokio::io::join(recv, send);
-            match read_value_max::<_, StreamKind>(&mut stream, MAX_STREAM_KIND_FRAME).await? {
-                StreamKind::Pair => pair(&mut stream, &code, &self.identity, Some(fp)).await,
-                StreamKind::File => Err(CoreError::Pairing("not paired yet".into())),
-            }
-        };
+        let exchange = pair(&mut stream, &code, &self.identity, Some(fp));
         let result = tokio::time::timeout(PAIRING_STREAM_TIMEOUT, exchange)
             .await
             .unwrap_or_else(|_| Err(pairing_timeout()));
@@ -185,28 +196,37 @@ impl Inner {
 
     /// Both devices keep the connection initiated by the lower device ID, so simultaneous
     /// dials settle on the same single connection.
+    ///
+    /// The pin is checked again here, under the peers lock, so a dial or handshake that was
+    /// in flight while the peer was forgotten (or re-paired) cannot slip in afterwards.
     pub(super) fn register(self: &Arc<Self>, peer: Uuid, conn: quinn::Connection, initiated_by_me: bool) {
-        {
-            let mut conns = self.conns.lock().unwrap();
-            if let Some(existing) = conns.get(&peer) {
-                let alive = existing.conn.close_reason().is_none();
-                // A reconnect from the same side replaces a connection that may be stale;
-                // otherwise the connection initiated by the lower device ID wins.
-                let new_wins = existing.initiated_by_me == initiated_by_me
-                    || (self.identity.device_id < peer) == initiated_by_me;
-                if alive && !new_wins {
-                    conn.close(0u32.into(), b"duplicate");
-                    return;
-                }
-                if alive {
-                    existing.conn.close(0u32.into(), b"replaced");
-                }
-            }
-            conns.insert(peer, Conn { conn: conn.clone(), initiated_by_me });
-        }
         let addr = conn.remote_address();
         let name = {
+            // Lock order everywhere: peers, then conns.
             let mut peers = self.peers.lock().unwrap();
+            let pinned = peers.get(peer).map(|p| p.fingerprint);
+            if pinned.is_none() || pinned != peer_fingerprint(&conn) {
+                conn.close(0u32.into(), b"not paired");
+                return;
+            }
+            {
+                let mut conns = self.conns.lock().unwrap();
+                if let Some(existing) = conns.get(&peer) {
+                    let alive = existing.conn.close_reason().is_none();
+                    // A reconnect from the same side replaces a connection that may be stale;
+                    // otherwise the connection initiated by the lower device ID wins.
+                    let new_wins = existing.initiated_by_me == initiated_by_me
+                        || (self.identity.device_id < peer) == initiated_by_me;
+                    if alive && !new_wins {
+                        conn.close(0u32.into(), b"duplicate");
+                        return;
+                    }
+                    if alive {
+                        existing.conn.close(0u32.into(), b"replaced");
+                    }
+                }
+                conns.insert(peer, Conn { conn: conn.clone(), initiated_by_me });
+            }
             let _ = peers.remember_address(peer, addr);
             peers.get(peer).map(|p| p.name.clone()).unwrap_or_default()
         };
