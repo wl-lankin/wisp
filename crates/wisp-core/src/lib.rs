@@ -10,6 +10,7 @@ pub mod pairing;
 pub mod peers;
 pub mod policy;
 pub mod protocol;
+pub mod screenshots;
 pub mod transfer;
 pub mod transport;
 

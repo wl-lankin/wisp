@@ -529,7 +529,7 @@ impl Inner {
         });
     }
 
-    async fn on_local(self: &Arc<Self>, payload: ClipPayload) {
+    pub(super) async fn on_local(self: &Arc<Self>, payload: ClipPayload) {
         let item = ClipItem::new(self.identity.device_id, payload);
         if let Err(e) = self.history.lock().unwrap().insert(&item) {
             tracing::warn!("timeline insert failed: {e}");

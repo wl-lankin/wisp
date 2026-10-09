@@ -350,6 +350,12 @@ impl Node {
         Ok(path)
     }
 
+    /// Adds a payload to the timeline and offers it to peers like a local copy,
+    /// without writing the clipboard or touching the echo guard.
+    pub async fn offer_local(&self, payload: ClipPayload) {
+        self.inner.on_local(payload).await
+    }
+
     pub async fn send_clipboard_to(&self, peer: Uuid) -> Result<()> {
         let payload = self
             .inner

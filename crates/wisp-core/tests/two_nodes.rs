@@ -394,3 +394,12 @@ async fn renaming_reaches_connected_peers_and_persists() {
     assert!(text.contains("Studio Mac"));
     assert!(matches!(a.node.rename("   ").await, Err(wisp_core::CoreError::Invalid(_))));
 }
+
+#[tokio::test]
+async fn offer_local_reaches_peers_without_touching_the_clipboard() {
+    let (a, mut b) = paired().await;
+    a.node.offer_local(ClipPayload::Text("from a screenshot".into())).await;
+    wait_for(&mut b.events, "offer", |e| matches!(e, Event::OfferReceived(_))).await;
+    assert_eq!(a.clip.current(), None);
+    assert_eq!(a.node.history(&HistoryQuery::default()).unwrap().len(), 1);
+}
