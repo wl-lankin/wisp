@@ -17,6 +17,7 @@ pub enum DeliveryMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct Peer {
     pub device_id: Uuid,
     pub name: String,
@@ -126,6 +127,8 @@ mod tests {
         }
         let store = PeerStore::open(&path).unwrap();
         assert_eq!(store.get(p.device_id), Some(&p));
+        let json = std::fs::read_to_string(&path).unwrap();
+        assert!(json.contains("\"deviceId\"") && json.contains(&p.fingerprint.to_hex()), "{json}");
     }
 
     #[test]

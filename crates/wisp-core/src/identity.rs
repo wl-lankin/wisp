@@ -24,8 +24,31 @@ impl Os {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Fingerprint(pub [u8; 32]);
+
+/// A hex string in JSON (the app contract and `peers.json`), raw bytes in compact binary
+/// formats such as the wire protocol.
+impl Serialize for Fingerprint {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&self.to_hex())
+        } else {
+            self.0.serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Fingerprint {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        if deserializer.is_human_readable() {
+            let hex = String::deserialize(deserializer)?;
+            Fingerprint::from_hex(&hex).ok_or_else(|| serde::de::Error::custom("expected 64 hex characters"))
+        } else {
+            <[u8; 32]>::deserialize(deserializer).map(Fingerprint)
+        }
+    }
+}
 
 impl Fingerprint {
     pub fn of(der: &[u8]) -> Self {
@@ -165,6 +188,18 @@ mod tests {
         assert_eq!(fp.to_hex().len(), 64);
         assert_eq!(Fingerprint::from_hex(&fp.to_hex()), Some(fp));
         assert_eq!(Fingerprint::from_hex("nothex"), None);
+    }
+
+    #[test]
+    fn fingerprint_is_hex_in_json_and_compact_on_the_wire() {
+        let fp = Fingerprint([0xab; 32]);
+        let json = serde_json::to_string(&fp).unwrap();
+        assert_eq!(json, format!("\"{}\"", fp.to_hex()));
+        assert_eq!(serde_json::from_str::<Fingerprint>(&json).unwrap(), fp);
+        assert!(serde_json::from_str::<Fingerprint>("\"abcd\"").is_err());
+        let wire = postcard::to_allocvec(&fp).unwrap();
+        assert_eq!(wire.len(), 32);
+        assert_eq!(postcard::from_bytes::<Fingerprint>(&wire).unwrap(), fp);
     }
 
     #[test]

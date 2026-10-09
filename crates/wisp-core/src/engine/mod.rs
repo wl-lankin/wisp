@@ -63,6 +63,7 @@ impl From<&InboxEntry> for OfferInfo {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PeerStatus {
     pub peer: Peer,
     pub online: bool,
@@ -70,6 +71,7 @@ pub struct PeerStatus {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NearbyDevice {
     pub device: Uuid,
     pub name: String,
@@ -78,7 +80,7 @@ pub struct NearbyDevice {
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum Event {
     PeerOnline { peer: Uuid, name: String, addr: SocketAddr },
     PeerOffline { peer: Uuid },
@@ -506,6 +508,56 @@ mod tests {
             if id == transfer_id && name == "big.bin"));
         let failed = wait_for(&mut events, |e| matches!(e, Event::TransferFailed { .. })).await;
         assert!(matches!(failed, Event::TransferFailed { transfer_id: id, peer: p, .. } if id == transfer_id && p == peer));
+    }
+
+    #[test]
+    fn events_serialize_as_camel_case_json() {
+        let id = Uuid::new_v4();
+        let progress = serde_json::to_value(Event::TransferProgress {
+            transfer_id: id,
+            peer: id,
+            name: "a.txt".into(),
+            done: 1,
+            total: 2,
+            outgoing: true,
+        })
+        .unwrap();
+        assert_eq!(progress["type"], "transferProgress");
+        assert_eq!(progress["transferId"], id.to_string());
+        assert!(progress.get("transfer_id").is_none());
+
+        let applied = serde_json::to_value(Event::ClipboardApplied { item_id: id, from: id }).unwrap();
+        assert_eq!(applied["itemId"], id.to_string());
+
+        let offer = serde_json::to_value(Event::OfferReceived(OfferInfo {
+            peer: id,
+            item_id: id,
+            kind: ItemKind::Text,
+            size: 2,
+            preview: Preview::Text("hi".into()),
+            age_ms: 5,
+        }))
+        .unwrap();
+        assert_eq!(offer["type"], "offerReceived");
+        assert_eq!((offer["itemId"].clone(), offer["ageMs"].clone()), (id.to_string().into(), 5.into()));
+
+        let me = Identity::generate("Me").unwrap();
+        let status = serde_json::to_value(PeerStatus { peer: pinned(&me, me.fingerprint()), online: true, addr: None }).unwrap();
+        assert_eq!(status["peer"]["deviceId"], me.device_id.to_string());
+        assert_eq!(status["peer"]["fingerprint"], me.fingerprint().to_hex());
+
+        let nearby = serde_json::to_value(Event::Discovered { device: id, name: "x".into(), os: Os::Linux, addresses: vec![] }).unwrap();
+        assert_eq!(nearby["type"], "discovered");
+
+        let entry = HistoryEntry {
+            id,
+            source: id,
+            kind: ItemKind::Text,
+            created_ms: 7,
+            size: 2,
+            preview: Preview::Text("hi".into()),
+        };
+        assert_eq!(serde_json::to_value(entry).unwrap()["createdMs"], 7);
     }
 
     #[tokio::test]

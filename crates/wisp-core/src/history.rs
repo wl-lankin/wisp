@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, ToSql};
+use serde::Serialize;
 use uuid::Uuid;
 
 use crate::fsutil::{create_private_dir, write_private_file};
@@ -9,7 +10,8 @@ use crate::Result;
 
 pub const HISTORY_CAP: usize = 200;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HistoryEntry {
     pub id: Uuid,
     pub source: Uuid,
