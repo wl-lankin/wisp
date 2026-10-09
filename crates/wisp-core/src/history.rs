@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, ToSql};
 use uuid::Uuid;
 
+use crate::fsutil::{create_private_dir, write_private_file};
 use crate::item::{ClipItem, ClipPayload, ItemKind, Preview};
 use crate::Result;
 
@@ -82,8 +83,18 @@ pub fn fts_query(input: &str) -> Option<String> {
 impl History {
     pub fn open(dir: &Path) -> Result<Self> {
         let blobs = dir.join("blobs");
-        std::fs::create_dir_all(&blobs)?;
-        let conn = Connection::open(dir.join("history.sqlite"))?;
+        create_private_dir(dir)?;
+        create_private_dir(&blobs)?;
+        let db_path = dir.join("history.sqlite");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if !db_path.exists() {
+                write_private_file(&db_path, &[])?;
+            }
+            std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        let conn = Connection::open(db_path)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS items (
                 id TEXT PRIMARY KEY,
@@ -112,7 +123,17 @@ impl History {
         if exists {
             return Ok(());
         }
-        std::fs::write(self.blob_path(item.id), postcard::to_allocvec(&item.payload)?)?;
+        let blob = self.blob_path(item.id);
+        write_private_file(&blob, &postcard::to_allocvec(&item.payload)?)?;
+        let result = self.insert_rows(item);
+        if result.is_err() {
+            let _ = std::fs::remove_file(&blob);
+            return result;
+        }
+        self.prune()
+    }
+
+    fn insert_rows(&mut self, item: &ClipItem) -> Result<()> {
         let preview = postcard::to_allocvec(&item.payload.preview())?;
         let tx = self.conn.transaction()?;
         tx.execute(
@@ -131,7 +152,7 @@ impl History {
             params![item.id.to_string(), search_text(&item.payload)],
         )?;
         tx.commit()?;
-        self.prune()
+        Ok(())
     }
 
     fn prune(&mut self) -> Result<()> {
@@ -224,6 +245,22 @@ mod tests {
 
     fn item(source: Uuid, text: &str) -> ClipItem {
         ClipItem::new(source, ClipPayload::Text(text.into()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_files_are_private_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut h = History::open(dir.path()).unwrap();
+        let it = item(Uuid::new_v4(), "secret");
+        h.insert(&it).unwrap();
+        assert_eq!(mode(dir.path()), 0o700);
+        assert_eq!(mode(&dir.path().join("blobs")), 0o700);
+        assert_eq!(mode(&dir.path().join("history.sqlite")), 0o600);
+        assert_eq!(mode(&dir.path().join("blobs").join(format!("{}.bin", it.id))), 0o600);
     }
 
     #[test]
