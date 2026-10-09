@@ -84,6 +84,7 @@ pub struct NearbyDevice {
 pub enum Event {
     PeerOnline { peer: Uuid, name: String, addr: SocketAddr },
     PeerOffline { peer: Uuid },
+    PeerRenamed { peer: Uuid, name: String },
     Discovered { device: Uuid, name: String, os: Os, addresses: Vec<SocketAddr> },
     IdentityChanged { peer: Uuid },
     Paired { peer: Uuid, name: String },
@@ -114,6 +115,8 @@ struct Inner {
     /// The current device name; `identity.name` is only the name from start-up.
     name: Mutex<String>,
     identity_path: PathBuf,
+    /// Serializes renames so disk, memory and the announced name stay in step.
+    rename_lock: tokio::sync::Mutex<()>,
     transport: Transport,
     clipboard: Arc<dyn ClipboardBackend>,
     events: mpsc::UnboundedSender<Event>,
@@ -170,6 +173,7 @@ impl Node {
         let inner = Arc::new(Inner {
             name: Mutex::new(cap_device_name(&identity.name)),
             identity_path,
+            rename_lock: tokio::sync::Mutex::new(()),
             identity,
             transport,
             clipboard: cfg.clipboard,

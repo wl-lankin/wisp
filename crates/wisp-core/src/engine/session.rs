@@ -83,6 +83,7 @@ impl Inner {
     /// Renames this device: persisted, re-advertised and sent to connected peers.
     pub(super) async fn rename(self: &Arc<Self>, name: &str) -> Result<String> {
         let name = cap_device_name(name);
+        let _serial = self.rename_lock.lock().await;
         if name.is_empty() {
             return Err(CoreError::Invalid("the device name cannot be empty".into()));
         }
@@ -404,11 +405,18 @@ impl Inner {
         match msg {
             Message::Hello { name, .. } => {
                 let name = cap_device_name(&name);
-                let mut peers = self.peers.lock().unwrap();
-                if let Some(existing) = peers.get(peer).cloned() {
-                    if existing.name != name {
-                        peers.upsert(Peer { name, ..existing })?;
+                let changed = {
+                    let mut peers = self.peers.lock().unwrap();
+                    match peers.get(peer).cloned() {
+                        Some(existing) if existing.name != name => {
+                            peers.upsert(Peer { name: name.clone(), ..existing })?;
+                            true
+                        }
+                        _ => false,
                     }
+                };
+                if changed {
+                    self.emit(Event::PeerRenamed { peer, name });
                 }
             }
             Message::Offer { item_id, kind, size, preview, live } => {

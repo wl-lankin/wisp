@@ -378,22 +378,18 @@ async fn timeline_items_export_to_files() {
 
 #[tokio::test]
 async fn renaming_reaches_connected_peers_and_persists() {
-    let (a, b) = paired().await;
+    let (a, mut b) = paired().await;
+    let a_id = a.node.device_id();
     let stored = a.node.rename("  Studio Mac  ").await.unwrap();
     assert_eq!(stored, "Studio Mac");
     assert_eq!(a.node.device_name(), "Studio Mac");
-    let a_id = a.node.device_id();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if b.node.peers().iter().any(|p| p.peer.device_id == a_id && p.peer.name == "Studio Mac") {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+    assert_eq!(a.node.device_id(), a_id);
+    wait_for(&mut b.events, "b sees the rename", |e| {
+        matches!(e, Event::PeerRenamed { peer, name } if *peer == a_id && name == "Studio Mac")
     })
-    .await
-    .expect("peer never saw the new name");
+    .await;
+    assert!(b.node.peers().iter().any(|p| p.peer.device_id == a_id && p.peer.name == "Studio Mac"));
     let text = std::fs::read_to_string(a.dir.path().join("data").join("identity.json")).unwrap();
     assert!(text.contains("Studio Mac"));
-    assert!(a.node.rename("   ").await.is_err());
+    assert!(matches!(a.node.rename("   ").await, Err(wisp_core::CoreError::Invalid(_))));
 }

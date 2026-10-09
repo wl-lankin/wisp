@@ -195,10 +195,8 @@ impl Discovery {
     /// Re-announces this device with new details (for example a new name).
     pub fn update(&self, advert: &Advert) -> Result<()> {
         let info = service_info(advert).map_err(mdns_err)?;
-        let fullname = info.get_fullname().to_string();
-        // Commands run in order on the daemon thread, so the old record is gone before the new
-        // one is announced.
-        self.daemon.unregister(&fullname).map_err(mdns_err)?;
+        // Registering the same instance again overwrites it and announces the new record.
+        // Unregistering first would send goodbye packets that make peers drop the device.
         self.daemon.register(info).map_err(mdns_err)
     }
 
