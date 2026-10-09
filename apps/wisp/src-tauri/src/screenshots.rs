@@ -19,33 +19,45 @@ impl ScreenshotService {
     /// Starts or stops watching to match `enabled`. Must run on the Tauri async runtime.
     #[cfg(target_os = "macos")]
     pub fn sync(&self, app: &AppHandle, enabled: bool) {
-        let mut slot = self.watcher.lock().unwrap();
         if !enabled {
-            *slot = None;
+            *self.watcher.lock().unwrap() = None;
             return;
         }
+        if self.watcher.lock().unwrap().is_some() {
+            return;
+        }
+        // Looking the folder up runs a subprocess, so it happens before the lock is taken again.
+        let folder = screenshot_folder();
+        let mut slot = self.watcher.lock().unwrap();
         if slot.is_some() {
             return;
+        }
+        if folder.fell_back {
+            notice(app, "Your screenshot folder was not found. Wisp is watching the Desktop instead.");
         }
         let handle = app.clone();
         let on_shot = std::sync::Arc::new(move |payload| {
             let handle = handle.clone();
             tauri::async_runtime::spawn(async move {
-                // Resolved per shot, so an engine restart is transparent. A shot taken while the
-                // engine is restarting has no node yet and is dropped.
+                // Resolved per shot, so an engine restart is transparent. Only a failed engine
+                // start leaves no node, and a shot taken then is dropped.
                 if let Ok(node) = handle.state::<crate::AppState>().engine.node().await {
                     node.offer_local(payload).await;
                 }
             });
         });
-        match ScreenshotWatcher::start(screenshot_folder(), is_screenshot, on_shot) {
+        let denied_handle = app.clone();
+        let on_denied = std::sync::Arc::new(move || {
+            notice(
+                &denied_handle,
+                "Wisp can't read your screenshot folder. Allow access in System Settings > Privacy & Security > Files and Folders.",
+            );
+        });
+        match ScreenshotWatcher::start(folder.path, is_screenshot, on_shot, on_denied) {
             Ok(watcher) => *slot = Some(watcher),
             Err(e) => {
                 tracing::warn!("screenshot watcher did not start: {e}");
-                let _ = app.emit(
-                    "wisp://event",
-                    serde_json::json!({ "type": "error", "message": "Wisp can't watch your screenshot folder." }),
-                );
+                notice(app, "Wisp can't watch your screenshot folder.");
             }
         }
     }
@@ -54,4 +66,10 @@ impl ScreenshotService {
     pub fn sync(&self, _app: &AppHandle, _enabled: bool) {
         *self.watcher.lock().unwrap() = None;
     }
+}
+
+/// Shows an error notice in the app.
+#[cfg(target_os = "macos")]
+fn notice(app: &AppHandle, message: &str) {
+    let _ = app.emit("wisp://event", serde_json::json!({ "type": "error", "message": message }));
 }

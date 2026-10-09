@@ -103,6 +103,13 @@ fn image_error(e: image::ImageError) -> CoreError {
     CoreError::Invalid(format!("image: {e}"))
 }
 
+/// Decides whether a file is a screenshot. An error means the answer could not be read;
+/// `PermissionDenied` is how macOS reports a folder the app may not access.
+pub type IsScreenshot = fn(&Path) -> std::io::Result<bool>;
+
+/// Called at most once per watcher when the folder turned out to be unreadable.
+pub type OnDenied = Arc<dyn Fn() + Send + Sync>;
+
 /// Watches one folder; dropping it stops watching.
 pub struct ScreenshotWatcher {
     _watcher: RecommendedWatcher,
@@ -112,8 +119,9 @@ pub struct ScreenshotWatcher {
 impl ScreenshotWatcher {
     pub fn start(
         folder: PathBuf,
-        is_screenshot: fn(&Path) -> bool,
+        is_screenshot: IsScreenshot,
         on_shot: Arc<dyn Fn(ClipPayload) + Send + Sync>,
+        on_denied: OnDenied,
     ) -> Result<ScreenshotWatcher> {
         let (tx, rx) = mpsc::unbounded_channel();
         // The notify callback runs on its own thread; an unbounded send never blocks it.
@@ -127,7 +135,7 @@ impl ScreenshotWatcher {
         })
         .map_err(watch_error)?;
         watcher.watch(&folder, RecursiveMode::NonRecursive).map_err(watch_error)?;
-        let task = tokio::spawn(process(rx, is_screenshot, on_shot));
+        let task = tokio::spawn(process(rx, is_screenshot, on_shot, on_denied));
         Ok(ScreenshotWatcher { _watcher: watcher, task })
     }
 }
@@ -156,9 +164,11 @@ fn changed_paths(event: &notify::Event) -> Vec<PathBuf> {
 
 async fn process(
     mut rx: mpsc::UnboundedReceiver<PathBuf>,
-    is_screenshot: fn(&Path) -> bool,
+    is_screenshot: IsScreenshot,
     on_shot: Arc<dyn Fn(ClipPayload) + Send + Sync>,
+    on_denied: OnDenied,
 ) {
+    let mut denied_reported = false;
     let mut seen = SeenFiles::new();
     // A path already waiting is not queued again. It leaves the set when its turn comes,
     // so events arriving while it is processed queue it once more.
@@ -179,6 +189,13 @@ async fn process(
         match screenshot_payload(&path, is_screenshot, &mut seen).await {
             Ok(Some(payload)) => on_shot(payload),
             Ok(None) => {}
+            Err(CoreError::Io(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                if !denied_reported {
+                    denied_reported = true;
+                    tracing::warn!("no permission to read {}: {e}", path.display());
+                    on_denied();
+                }
+            }
             Err(e) => tracing::debug!("skipping {}: {e}", path.display()),
         }
     }
@@ -196,11 +213,11 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
 
 async fn screenshot_payload(
     path: &Path,
-    is_screenshot: fn(&Path) -> bool,
+    is_screenshot: IsScreenshot,
     seen: &mut SeenFiles,
 ) -> Result<Option<ClipPayload>> {
     // Cheap check first; an attribute set late arrives as a later metadata event.
-    if !is_screenshot(path) {
+    if !is_screenshot(path)? {
         return Ok(None);
     }
     wait_until_stable(path, STABLE_INTERVAL, STABLE_MAX).await?;
@@ -255,29 +272,49 @@ async fn heic_to_png(src: PathBuf) -> Result<Vec<u8>> {
 
 /// True when macOS marked the file as a screen capture.
 #[cfg(target_os = "macos")]
-pub fn is_screenshot(path: &Path) -> bool {
-    matches!(xattr::get(path, "com.apple.metadata:kMDItemIsScreenCapture"), Ok(Some(_)))
+pub fn is_screenshot(path: &Path) -> std::io::Result<bool> {
+    xattr::get(path, "com.apple.metadata:kMDItemIsScreenCapture").map(|value| value.is_some())
+}
+
+/// The folder to watch, and whether a configured location was missing so the Desktop is used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenshotFolder {
+    pub path: PathBuf,
+    pub fell_back: bool,
+}
+
+/// Parses the value of the macOS `com.apple.screencapture location` default.
+pub fn configured_location(raw: &str, home: &Path) -> Option<PathBuf> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(match raw.strip_prefix('~') {
+        Some(rest) => home.join(rest.trim_start_matches('/')),
+        None => PathBuf::from(raw),
+    })
+}
+
+/// A configured folder that exists wins; a configured one that is gone falls back to the Desktop.
+pub fn resolve_folder(configured: Option<PathBuf>, home: &Path) -> ScreenshotFolder {
+    match configured {
+        Some(dir) if dir.is_dir() => ScreenshotFolder { path: dir, fell_back: false },
+        Some(_) => ScreenshotFolder { path: home.join("Desktop"), fell_back: true },
+        None => ScreenshotFolder { path: home.join("Desktop"), fell_back: false },
+    }
 }
 
 /// The folder macOS saves screenshots to: the user's setting, or the Desktop.
 #[cfg(target_os = "macos")]
-pub fn screenshot_folder() -> PathBuf {
+pub fn screenshot_folder() -> ScreenshotFolder {
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
     let configured = std::process::Command::new("defaults")
         .args(["read", "com.apple.screencapture", "location"])
         .output()
         .ok()
         .filter(|out| out.status.success())
-        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .map(|s| match s.strip_prefix('~') {
-            Some(rest) => home.join(rest.trim_start_matches('/')),
-            None => PathBuf::from(s),
-        });
-    match configured {
-        Some(dir) if dir.is_dir() => dir,
-        _ => home.join("Desktop"),
-    }
+        .and_then(|out| configured_location(&String::from_utf8_lossy(&out.stdout), &home));
+    resolve_folder(configured, &home)
 }
 
 impl Drop for ScreenshotWatcher {
@@ -382,6 +419,21 @@ mod tests {
         (Arc::new(move |p| drop(tx.send(p))), rx)
     }
 
+    fn no_denied() -> OnDenied {
+        Arc::new(|| {})
+    }
+
+    fn counting_denied() -> (OnDenied, Arc<std::sync::atomic::AtomicUsize>) {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = count.clone();
+        (
+            Arc::new(move || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }),
+            count,
+        )
+    }
+
     async fn next(rx: &mut mpsc::UnboundedReceiver<ClipPayload>) -> ClipPayload {
         tokio::time::timeout(Duration::from_secs(15), rx.recv())
             .await
@@ -398,7 +450,7 @@ mod tests {
     async fn watcher_offers_a_new_png_once_and_ignores_other_files() {
         let dir = tempfile::tempdir().unwrap();
         let (on_shot, mut rx) = collecting();
-        let _watcher = ScreenshotWatcher::start(dir.path().to_path_buf(), |_| true, on_shot).unwrap();
+        let _watcher = ScreenshotWatcher::start(dir.path().to_path_buf(), |_| Ok(true), on_shot, no_denied()).unwrap();
         std::fs::write(dir.path().join("download.tmp"), b"partial").unwrap();
         std::fs::write(dir.path().join("Screenshot.png"), encoded(16, 9, image::ImageFormat::Png)).unwrap();
         match next(&mut rx).await {
@@ -413,7 +465,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("Screenshot.png");
         let (on_shot, mut rx) = collecting();
-        let _watcher = ScreenshotWatcher::start(dir.path().to_path_buf(), |_| true, on_shot).unwrap();
+        let _watcher = ScreenshotWatcher::start(dir.path().to_path_buf(), |_| Ok(true), on_shot, no_denied()).unwrap();
         let bytes = encoded(8, 8, image::ImageFormat::Png);
         std::fs::write(&path, &bytes).unwrap();
         next(&mut rx).await;
@@ -430,7 +482,7 @@ mod tests {
     async fn a_renamed_screenshot_is_not_offered_again() {
         let dir = tempfile::tempdir().unwrap();
         let (on_shot, mut rx) = collecting();
-        let _watcher = ScreenshotWatcher::start(dir.path().to_path_buf(), |_| true, on_shot).unwrap();
+        let _watcher = ScreenshotWatcher::start(dir.path().to_path_buf(), |_| Ok(true), on_shot, no_denied()).unwrap();
         let first = dir.path().join("Screenshot.png");
         std::fs::write(&first, encoded(8, 6, image::ImageFormat::Png)).unwrap();
         next(&mut rx).await;
@@ -442,7 +494,7 @@ mod tests {
     async fn a_hidden_temp_file_renamed_into_place_is_offered_once() {
         let dir = tempfile::tempdir().unwrap();
         let (on_shot, mut rx) = collecting();
-        let _watcher = ScreenshotWatcher::start(dir.path().to_path_buf(), |_| true, on_shot).unwrap();
+        let _watcher = ScreenshotWatcher::start(dir.path().to_path_buf(), |_| Ok(true), on_shot, no_denied()).unwrap();
         let temp = dir.path().join(".Screenshot x.png");
         std::fs::write(&temp, encoded(10, 5, image::ImageFormat::Png)).unwrap();
         std::fs::rename(&temp, dir.path().join("Screenshot x.png")).unwrap();
@@ -457,9 +509,54 @@ mod tests {
     async fn watcher_skips_files_that_are_not_screenshots() {
         let dir = tempfile::tempdir().unwrap();
         let (on_shot, mut rx) = collecting();
-        let _watcher = ScreenshotWatcher::start(dir.path().to_path_buf(), |_| false, on_shot).unwrap();
+        let _watcher = ScreenshotWatcher::start(dir.path().to_path_buf(), |_| Ok(false), on_shot, no_denied()).unwrap();
         std::fs::write(dir.path().join("photo.png"), encoded(4, 4, image::ImageFormat::Png)).unwrap();
         assert_quiet(&mut rx).await;
+    }
+
+    #[tokio::test]
+    async fn a_permission_error_is_reported_once_per_watcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let (on_shot, mut rx) = collecting();
+        let (on_denied, count) = counting_denied();
+        let denied: IsScreenshot = |_| Err(std::io::ErrorKind::PermissionDenied.into());
+        let _watcher = ScreenshotWatcher::start(dir.path().to_path_buf(), denied, on_shot, on_denied).unwrap();
+        std::fs::write(dir.path().join("a.png"), encoded(4, 4, image::ImageFormat::Png)).unwrap();
+        std::fs::write(dir.path().join("b.png"), encoded(5, 5, image::ImageFormat::Png)).unwrap();
+        assert_quiet(&mut rx).await;
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn other_read_errors_are_not_reported_as_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let (on_shot, mut rx) = collecting();
+        let (on_denied, count) = counting_denied();
+        let failing: IsScreenshot = |_| Err(std::io::ErrorKind::NotFound.into());
+        let _watcher = ScreenshotWatcher::start(dir.path().to_path_buf(), failing, on_shot, on_denied).unwrap();
+        std::fs::write(dir.path().join("a.png"), encoded(4, 4, image::ImageFormat::Png)).unwrap();
+        assert_quiet(&mut rx).await;
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn the_configured_location_is_parsed() {
+        let home = Path::new("/Users/me");
+        assert_eq!(configured_location("~/Pictures/Shots\n", home), Some(home.join("Pictures/Shots")));
+        assert_eq!(configured_location("  \n", home), None);
+        assert_eq!(configured_location("/Volumes/x\n", home), Some(PathBuf::from("/Volumes/x")));
+    }
+
+    #[test]
+    fn a_missing_configured_folder_falls_back_to_the_desktop() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Path::new("/Users/me");
+        let kept = resolve_folder(Some(dir.path().to_path_buf()), home);
+        assert_eq!(kept, ScreenshotFolder { path: dir.path().to_path_buf(), fell_back: false });
+        let missing = resolve_folder(Some(dir.path().join("gone")), home);
+        assert_eq!(missing, ScreenshotFolder { path: home.join("Desktop"), fell_back: true });
+        let unset = resolve_folder(None, home);
+        assert_eq!(unset, ScreenshotFolder { path: home.join("Desktop"), fell_back: false });
     }
 
     #[cfg(target_os = "macos")]
@@ -468,12 +565,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("plain.png");
         std::fs::write(&path, encoded(4, 4, image::ImageFormat::Png)).unwrap();
-        assert!(!is_screenshot(&path));
+        assert!(!is_screenshot(&path).unwrap());
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn the_screenshot_folder_exists() {
-        assert!(screenshot_folder().is_dir());
+        assert!(screenshot_folder().path.is_dir());
     }
 }
