@@ -96,6 +96,31 @@ describe('SettingsView', () => {
     w.unmount()
   })
 
+  it('does nothing when Enter is pressed on an unchanged or empty name', async () => {
+    const { api } = await import('../lib/api')
+    const rename = api.renameDevice as unknown as ReturnType<typeof vi.fn>
+    rename.mockClear()
+    const w = await mountView()
+    const input = w.find('[data-testid="device-name"]')
+    await input.trigger('keydown.enter')
+    await input.setValue('   ')
+    await input.trigger('keydown.enter')
+    await flushPromises()
+    expect(rename).not.toHaveBeenCalled()
+    w.unmount()
+  })
+
+  it('says "1 older item" in the singular', async () => {
+    const { api } = await import('../lib/api')
+    ;(api.historyCount as unknown as ReturnType<typeof vi.fn>).mockResolvedValue(51)
+    const w = await mountView()
+    await w.find('[data-testid="size-50"]').trigger('click')
+    await flushPromises()
+    expect(w.text()).toContain('This removes 1 older item.')
+    expect(w.text()).not.toContain('1 older items')
+    w.unmount()
+  })
+
   it('asks before shrinking the timeline and saves only after Remove', async () => {
     const { api } = await import('../lib/api')
     const update = api.updateSettings as unknown as ReturnType<typeof vi.fn>

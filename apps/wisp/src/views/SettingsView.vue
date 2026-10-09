@@ -47,7 +47,7 @@ const nameReady = computed(() => {
 
 async function renameDevice() {
   const name = nameInput.value.trim()
-  if (!name || renaming.value) return
+  if (!nameReady.value || renaming.value) return
   renaming.value = true
   try {
     const applied = await api.renameDevice(name)
@@ -310,7 +310,7 @@ const themes: { id: Theme; name: string }[] = [
           >{{ n.toLocaleString('en-US') }} items</button>
         </div>
         <div v-if="pendingSize" class="flex items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2" role="alert">
-          <span>This removes {{ pendingSize.remove }} older items.</span>
+          <span>This removes {{ pendingSize.remove }} older {{ pendingSize.remove === 1 ? 'item' : 'items' }}.</span>
           <button data-testid="size-remove" class="hoverable rounded-lg px-2 py-1 text-[var(--danger)] hover:bg-[var(--surface-strong)]" @click="confirmSize">Remove</button>
           <button data-testid="size-cancel" class="hoverable rounded-lg px-2 py-1 hover:bg-[var(--surface-strong)]" @click="cancelSize">Cancel</button>
         </div>
