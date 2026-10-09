@@ -9,6 +9,7 @@ pub mod pairing;
 pub mod peers;
 pub mod policy;
 pub mod protocol;
+pub mod transfer;
 pub mod transport;
 
 pub use error::{CoreError, Result};
