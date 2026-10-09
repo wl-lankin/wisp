@@ -19,9 +19,11 @@ const working = ref<string | null>(null)
 const isMac = computed(() => state.platform === 'macos')
 const hotkeyHint = computed(() => displayCombo(settings.value?.hotkey ?? 'Ctrl+Alt+V', isMac.value))
 
-/** Errors from before the toast last came back are old news and stay in the other windows. */
-let errorsAfter = 0
-const latestError = computed(() => [...state.notices].reverse().find((n) => n.kind === 'error' && n.id > errorsAfter) ?? null)
+/** Errors from before the toast last hid or came back are old news and stay in the other windows. */
+const errorsAfter = ref(0)
+const maxNoticeId = () => state.notices.reduce((max, n) => Math.max(max, n.id), 0)
+const latestError = computed(() => [...state.notices].reverse().find((n) => n.kind === 'error' && n.id > errorsAfter.value) ?? null)
+const newestErrorId = computed(() => state.notices.reduce((max, n) => (n.kind === 'error' ? Math.max(max, n.id) : max), 0))
 
 const groups = computed(() =>
   groupOffers(state.inbox, (id) => state.peers.find((p) => p.peer.deviceId === id)?.peer.name ?? 'A device'),
@@ -31,17 +33,35 @@ const FADE_MS = 200
 let fadeTimer: ReturnType<typeof setTimeout> | undefined
 let lastHeight = 0
 
+function wake() {
+  clearTimeout(fadeTimer)
+  hidden.value = false
+  hovering.value = false
+  lastChange.value = Date.now()
+}
+
 // Every offer brings the toast back, even a repeat of one it already shows.
 watch(
   () => state.offerSeq,
   () => {
-    if (hidden.value) errorsAfter = state.notices.reduce((max, n) => Math.max(max, n.id), errorsAfter)
-    clearTimeout(fadeTimer)
-    hidden.value = false
-    hovering.value = false
-    lastChange.value = Date.now()
+    if (hidden.value) errorsAfter.value = maxNoticeId()
+    wake()
   },
 )
+
+// A new error brings the toast back too, even when it had already hidden itself.
+// Only a clipboard error (the one the app itself raises the toast for) may do so while hidden.
+let seenErrorId = 0
+watch(newestErrorId, (id) => {
+  if (id <= seenErrorId) return
+  seenErrorId = id
+  const error = state.notices.find((n) => n.id === id)
+  if (hidden.value) {
+    if (!error?.text.includes('clipboard')) return
+    errorsAfter.value = state.notices.reduce((max, n) => (n.id < id ? Math.max(max, n.id) : max), 0)
+  }
+  wake()
+})
 
 watch(
   () => state.inbox.map((o) => o.itemId).join(','),
@@ -49,6 +69,7 @@ watch(
     hovering.value = false
     lastChange.value = Date.now()
     if (state.inbox.length > 0) {
+      if (hidden.value) errorsAfter.value = maxNoticeId()
       clearTimeout(fadeTimer)
       hidden.value = false
     }
@@ -66,6 +87,7 @@ function report() {
 function hideSelf() {
   hovering.value = false
   hidden.value = true
+  errorsAfter.value = maxNoticeId()
   fadeTimer = setTimeout(() => void api.hideWindow('toast'), FADE_MS)
 }
 

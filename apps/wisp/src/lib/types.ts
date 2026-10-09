@@ -63,6 +63,7 @@ export interface Snapshot {
   nearby: NearbyDevice[]
   inbox: Offer[]
   hotkeyError?: string | null
+  clipboardError?: { seq: number; message: string } | null
 }
 
 export interface AppSettings {
@@ -89,6 +90,6 @@ export type EngineEvent =
   | { type: 'transferPaused'; transferId: string; peer: string }
   | { type: 'transferDone'; transferId: string; peer: string; path: string | null }
   | { type: 'transferFailed'; transferId: string; peer: string; reason: string }
-  | { type: 'error'; message: string }
+  | { type: 'error'; message: string; seq?: number }
   | { type: 'inboxChanged' }
   | { type: 'peersChanged' }

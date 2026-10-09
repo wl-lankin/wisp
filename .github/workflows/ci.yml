@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main, core-engine, tray-ui, release]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/wisp/package-lock.json
+      - name: Install frontend dependencies
+        working-directory: apps/wisp
+        run: npm ci
+      - name: Check versions
+        working-directory: apps/wisp
+        run: npm run check-versions
+      - name: Frontend tests
+        working-directory: apps/wisp
+        run: npm test
+      - name: Frontend build
+        working-directory: apps/wisp
+        run: npm run build
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Rust tests
+        run: cargo test --workspace

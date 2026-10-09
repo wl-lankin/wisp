@@ -30,10 +30,37 @@ pub struct AppState {
     pub panel_blurred_at: Mutex<Option<Instant>>,
     /// Why the catch shortcut is not registered, shown in the UI until a later registration succeeds.
     pub hotkey_error: Mutex<Option<String>>,
+    /// The last clipboard write failure, kept for a toast window that did not exist when it happened.
+    pub clipboard_error: Mutex<ClipboardErrorLog>,
     /// True while a shortcut press is being handled, so a held key does not stack catches.
     pub hotkey_busy: AtomicBool,
     /// Held for a whole settings change, so two quick saves cannot interleave and undo each other.
     pub settings_change: tokio::sync::Mutex<()>,
+}
+
+/// The newest clipboard write failure with a sequence number, until a later write succeeds.
+#[derive(Default)]
+pub struct ClipboardErrorLog {
+    seq: u64,
+    current: Option<String>,
+}
+
+impl ClipboardErrorLog {
+    /// Notes a failure and returns its sequence number.
+    pub fn record(&mut self, message: &str) -> u64 {
+        self.seq += 1;
+        self.current = Some(message.to_string());
+        self.seq
+    }
+
+    /// Forgets the failure once a clipboard write succeeded.
+    pub fn clear(&mut self) {
+        self.current = None;
+    }
+
+    pub fn current(&self) -> Option<(u64, String)> {
+        self.current.clone().map(|message| (self.seq, message))
+    }
 }
 
 struct TauriSink {
@@ -41,7 +68,17 @@ struct TauriSink {
 }
 
 impl EventSink for TauriSink {
-    fn emit(&self, value: serde_json::Value) {
+    fn emit(&self, mut value: serde_json::Value) {
+        let kind = value.get("type").and_then(|t| t.as_str()).unwrap_or_default().to_string();
+        if kind == "clipboardApplied" {
+            self.app.state::<AppState>().clipboard_error.lock().unwrap().clear();
+        } else if kind == "error" {
+            let message = value.get("message").and_then(|m| m.as_str()).unwrap_or_default().to_string();
+            if message.contains("clipboard") {
+                let seq = self.app.state::<AppState>().clipboard_error.lock().unwrap().record(&message);
+                value["seq"] = serde_json::json!(seq);
+            }
+        }
         let _ = self.app.emit("wisp://event", value);
     }
 
@@ -55,6 +92,9 @@ impl EventSink for TauriSink {
             Event::ClipboardApplied { .. } => {
                 let app = self.app.clone();
                 tauri::async_runtime::spawn(async move { tray::inbox_changed(&app).await });
+            }
+            Event::Error { message } if message.contains("clipboard") => {
+                let _ = windows::show(&self.app, windows::View::Toast);
             }
             _ => {}
         }
@@ -160,6 +200,7 @@ pub fn run() {
                 tray_rect: Mutex::new(None),
                 panel_blurred_at: Mutex::new(None),
                 hotkey_error: Mutex::new(None),
+                clipboard_error: Mutex::new(ClipboardErrorLog::default()),
                 hotkey_busy: AtomicBool::new(false),
                 settings_change: tokio::sync::Mutex::new(()),
             });
@@ -211,4 +252,22 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClipboardErrorLog;
+
+    #[test]
+    fn clipboard_error_log_numbers_failures_and_clears_on_success() {
+        let mut log = ClipboardErrorLog::default();
+        assert_eq!(log.current(), None);
+        assert_eq!(log.record("first"), 1);
+        assert_eq!(log.current(), Some((1, "first".to_string())));
+        assert_eq!(log.record("second"), 2);
+        assert_eq!(log.current(), Some((2, "second".to_string())));
+        log.clear();
+        assert_eq!(log.current(), None);
+        assert_eq!(log.record("third"), 3);
+    }
 }

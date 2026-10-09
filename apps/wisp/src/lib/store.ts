@@ -31,6 +31,8 @@ export interface State {
   notices: Notice[]
   identityWarnings: string[]
   hotkeyErrorShown: string
+  /** Sequence number of the newest clipboard error already shown, live or from a snapshot. */
+  clipboardErrorShown: number
   historyVersion: number
   /** Bumped on every offer, including repeats of one already in the inbox, so the toast can wake up. */
   offerSeq: number
@@ -53,6 +55,7 @@ export function initialState(): State {
     notices: [],
     identityWarnings: [],
     hotkeyErrorShown: '',
+    clipboardErrorShown: 0,
     historyVersion: 0,
     offerSeq: 0,
   }
@@ -70,6 +73,12 @@ export function applySnapshot(s: State, snap: Snapshot): void {
   const problem = snap.hotkeyError ?? ''
   if (problem && problem !== s.hotkeyErrorShown) notify(s, 'warning', problem)
   s.hotkeyErrorShown = problem
+  // A window created after the failure never saw the event, so the snapshot carries it once.
+  const clipboard = snap.clipboardError
+  if (clipboard && clipboard.seq > s.clipboardErrorShown) {
+    s.clipboardErrorShown = clipboard.seq
+    notify(s, 'error', clipboard.message)
+  }
 }
 
 export function pushNotice(s: State, kind: Notice['kind'], text: string): void {
@@ -172,6 +181,7 @@ export function reduce(s: State, e: EngineEvent): boolean {
       return false
     }
     case 'error':
+      if (e.seq !== undefined) s.clipboardErrorShown = Math.max(s.clipboardErrorShown, e.seq)
       notify(s, 'error', e.message)
       return false
     case 'inboxChanged':
