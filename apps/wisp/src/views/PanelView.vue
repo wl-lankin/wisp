@@ -33,11 +33,14 @@ function nameOf(id: string): string {
   return state.peers.find((p) => p.peer.deviceId === id)?.peer.name ?? 'Unknown device'
 }
 
+let seq = 0
 async function loadRecent() {
+  const mine = ++seq
   try {
-    recent.value = await api.history({ text: search.value || undefined, limit: 5 })
+    const rows = await api.history({ text: search.value || undefined, limit: 5 })
+    if (mine === seq) recent.value = rows
   } catch {
-    recent.value = []
+    if (mine === seq) recent.value = []
   }
 }
 
@@ -85,6 +88,15 @@ function copyItem(id: string) {
   void run(() => api.copyFromHistory(id))
 }
 
+function sendDropped(peerId: string, paths: string[]) {
+  const target = state.peers.find((x) => x.peer.deviceId === peerId)
+  if (target && !target.online) {
+    pushNotice(state, 'warning', `${target.peer.name} is offline. Try again when it is back.`)
+    return
+  }
+  void run(() => api.sendFiles(peerId, paths))
+}
+
 function sendClipboard() {
   const p = selectedPeer.value
   if (!p) return
@@ -110,10 +122,11 @@ function onKey(e: KeyboardEvent) {
 }
 
 let unlistenDrop: (() => void) | undefined
+let disposed = false
 onMounted(async () => {
   window.addEventListener('keydown', onKey)
   try {
-    unlistenDrop = await getCurrentWebview().onDragDropEvent((event) => {
+    const unlisten = await getCurrentWebview().onDragDropEvent((event) => {
       const p = event.payload
       if (p.type === 'leave') {
         dropTarget.value = null
@@ -123,16 +136,20 @@ onMounted(async () => {
       const peer = peerIdAt(document.elementFromPoint(pt.x, pt.y))
       if (p.type === 'drop') {
         dropTarget.value = null
-        if (peer && p.paths.length) void run(() => api.sendFiles(peer, p.paths))
+        if (peer && p.paths.length) sendDropped(peer, p.paths)
       } else {
         dropTarget.value = peer
       }
     })
+    if (disposed) unlisten()
+    else unlistenDrop = unlisten
   } catch {
     pushNotice(state, 'warning', 'Dropping files on a device is unavailable right now.')
   }
 })
 onUnmounted(() => {
+  disposed = true
+  clearTimeout(searchTimer)
   window.removeEventListener('keydown', onKey)
   unlistenDrop?.()
 })
