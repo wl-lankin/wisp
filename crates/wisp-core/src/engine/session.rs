@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use super::{Conn, Event, Inner, OfferInfo, StreamKind};
 use crate::clipboard::{spawn_monitor, write_and_mark};
+use crate::fsutil::write_private_file;
 use crate::identity::Fingerprint;
 use crate::item::{ClipItem, ClipPayload, Preview, MAX_CLIP_BYTES};
 use crate::pairing::{pair, PairInfo};
@@ -365,8 +366,12 @@ impl Inner {
             ClipPayload::Html { html, .. } => html.into_bytes(),
             ClipPayload::Image { png, .. } => png,
         };
-        let path = self.tmp_dir.join(format!("{item_id}-{name}"));
-        tokio::fs::write(&path, bytes).await?;
+        // A fresh path per serve, so concurrent pulls of one item never share a spill file.
+        let path = self.tmp_dir.join(format!("{}-{name}", Uuid::new_v4()));
+        let spill = path.clone();
+        tokio::task::spawn_blocking(move || write_private_file(&spill, &bytes))
+            .await
+            .map_err(|e| CoreError::Transfer(e.to_string()))??;
         self.spawn_send(peer, path, name, true);
         Ok(())
     }

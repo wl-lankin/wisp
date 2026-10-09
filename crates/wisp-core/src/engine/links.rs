@@ -9,6 +9,10 @@ use crate::discovery::{Advert, Discovered, Discovery, DiscoveryEvent};
 use crate::Result;
 
 impl Inner {
+    pub(super) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
     /// Periodically dials every paired peer that is not connected, using remembered and
     /// discovered addresses. Both sides dial; `register` keeps one connection.
     pub(super) fn spawn_dialer(self: Arc<Self>, every: Duration) {
@@ -16,7 +20,7 @@ impl Inner {
             let mut ticker = tokio::time::interval(every);
             loop {
                 ticker.tick().await;
-                if self.closed.load(Ordering::SeqCst) {
+                if self.is_closed() {
                     break;
                 }
                 let offline: Vec<Uuid> = {
@@ -32,7 +36,7 @@ impl Inner {
     }
 
     pub(super) fn dial(self: Arc<Self>, peer: Uuid) {
-        if !self.dialing.lock().unwrap().insert(peer) {
+        if self.is_closed() || !self.dialing.lock().unwrap().insert(peer) {
             return;
         }
         let target = {

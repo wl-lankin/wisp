@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::identity::{Fingerprint, Os};
+use crate::peers::MAX_ADDRESSES;
 use crate::{CoreError, Result};
 
 pub const SERVICE_TYPE: &str = "_wisp._udp.local.";
@@ -91,21 +92,25 @@ impl DiscoveredSet {
         Self::default()
     }
 
-    pub fn merge(&mut self, d: Discovered) -> bool {
+    /// Returns whether the device or one of its addresses is new. Addresses are capped at
+    /// `MAX_ADDRESSES` with the latest advert first, so spoofed adverts cannot grow the dial
+    /// fan-out without bound.
+    pub fn merge(&mut self, mut d: Discovered) -> bool {
         match self.map.get_mut(&d.device_id) {
             None => {
+                d.addresses.truncate(MAX_ADDRESSES);
                 self.map.insert(d.device_id, d);
                 true
             }
             Some(existing) => {
                 existing.name = d.name;
-                let mut changed = false;
-                for addr in d.addresses {
-                    if !existing.addresses.contains(&addr) {
-                        existing.addresses.push(addr);
-                        changed = true;
-                    }
-                }
+                let changed = d.addresses.iter().any(|a| !existing.addresses.contains(a));
+                let older: Vec<SocketAddr> =
+                    existing.addresses.iter().copied().filter(|a| !d.addresses.contains(a)).collect();
+                let mut addresses = d.addresses;
+                addresses.extend(older);
+                addresses.truncate(MAX_ADDRESSES);
+                existing.addresses = addresses;
                 changed
             }
         }
@@ -243,6 +248,24 @@ mod tests {
         assert_eq!(set.get(a.device_id).unwrap().addresses.len(), 2);
         set.remove(a.device_id);
         assert!(set.all().is_empty());
+    }
+
+    #[test]
+    fn merged_addresses_are_capped_with_the_latest_first() {
+        let a = advert();
+        let at = |i: u16| -> SocketAddr { format!("192.168.1.{i}:47800").parse().unwrap() };
+        let mut set = DiscoveredSet::new();
+        let many: Vec<IpAddr> = (1..=12).map(|i| format!("10.0.0.{i}").parse().unwrap()).collect();
+        set.merge(parse_txt(&txt_properties(&a), &many, a.port).unwrap());
+        assert_eq!(set.get(a.device_id).unwrap().addresses.len(), MAX_ADDRESSES);
+
+        for i in 1..=20u16 {
+            set.merge(Discovered { addresses: vec![at(i)], ..parse_txt(&txt_properties(&a), &[], a.port).unwrap() });
+        }
+        let addrs = &set.get(a.device_id).unwrap().addresses;
+        assert_eq!(addrs.len(), MAX_ADDRESSES);
+        assert_eq!(addrs[0], at(20));
+        assert_eq!(addrs[MAX_ADDRESSES - 1], at(13));
     }
 
     #[tokio::test]

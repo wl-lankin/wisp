@@ -78,6 +78,10 @@ impl Inner {
         tokio::spawn(async move {
             let mut first_failure: Option<Instant> = None;
             loop {
+                if this.is_closed() {
+                    this.emit(Event::TransferFailed { transfer_id, peer, reason: "shut down".into() });
+                    break;
+                }
                 match this.send_one(peer, transfer_id, &path, &name).await {
                     Ok(()) => {
                         this.emit(Event::TransferDone { transfer_id, peer, path: None });

@@ -15,12 +15,14 @@ use uuid::Uuid;
 
 use crate::clipboard::{write_and_mark, ClipboardBackend, EchoGuard};
 use crate::discovery::{DiscoveredSet, Discovery};
+use crate::fsutil::create_private_dir;
 use crate::history::{History, HistoryEntry, HistoryQuery};
 use crate::identity::{Identity, Os};
 use crate::item::{ClipItem, ItemKind, Preview};
 use crate::pairing::PairingSession;
 use crate::peers::{DeliveryMode, Peer, PeerStore};
 use crate::policy::{offer_for, Inbox, InboxEntry, OfferQueue};
+use crate::protocol::Message;
 use crate::transfer::{cleanup_partials, expand_paths, RESUME_WINDOW};
 use crate::transport::Transport;
 use crate::{CoreError, Result};
@@ -141,8 +143,13 @@ impl Node {
         let peers = PeerStore::open(&cfg.data_dir.join("peers.json"))?;
         let history = History::open(&cfg.data_dir.join("history"))?;
         std::fs::create_dir_all(&cfg.save_dir)?;
+        // tmp only holds clipboard spills of a previous run, which may carry secrets.
         let tmp_dir = cfg.data_dir.join("tmp");
-        std::fs::create_dir_all(&tmp_dir)?;
+        match std::fs::remove_dir_all(&tmp_dir) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+        create_private_dir(&tmp_dir)?;
         cleanup_partials(&cfg.save_dir, RESUME_WINDOW)?;
 
         let (events, rx) = mpsc::unbounded_channel();
@@ -242,7 +249,12 @@ impl Node {
             .unwrap()
             .take(item_id)
             .ok_or_else(|| CoreError::Transfer("this offer is no longer available".into()))?;
-        let result = self.inner.request_pull(entry.peer, item_id).await;
+        // A file-sized item arrives as a file transfer, never as a Push, so it is not tracked.
+        let result = if entry.kind == ItemKind::File {
+            self.inner.send_to(entry.peer, &Message::Pull { item_id }).await
+        } else {
+            self.inner.request_pull(entry.peer, item_id).await
+        };
         if result.is_err() {
             self.inner.inbox.lock().unwrap().add(entry);
         }
@@ -299,6 +311,9 @@ impl Node {
 
     /// Manual "add by IP" for a paired device; dials right away.
     pub fn add_address(&self, peer: Uuid, addr: SocketAddr) -> Result<()> {
+        if self.inner.is_closed() {
+            return Ok(());
+        }
         self.inner.peers.lock().unwrap().remember_address(peer, addr)?;
         self.inner.clone().dial(peer);
         Ok(())
@@ -332,9 +347,9 @@ mod tests {
 
     use super::*;
     use crate::clipboard::MemoryClipboard;
-    use crate::item::ClipPayload;
+    use crate::item::{ClipPayload, MAX_CLIP_BYTES};
 
-    async fn node(dir: &std::path::Path) -> (Node, Arc<MemoryClipboard>) {
+    async fn start_node(dir: &std::path::Path) -> (Node, Arc<MemoryClipboard>, mpsc::UnboundedReceiver<Event>) {
         let clip = Arc::new(MemoryClipboard::new());
         let cfg = NodeConfig {
             data_dir: dir.join("data"),
@@ -346,8 +361,107 @@ mod tests {
             clipboard_poll: Duration::from_millis(20),
             dial_interval: Duration::from_millis(200),
         };
-        let (node, _events) = Node::start(cfg).await.unwrap();
+        let (node, events) = Node::start(cfg).await.unwrap();
+        (node, clip, events)
+    }
+
+    async fn node(dir: &std::path::Path) -> (Node, Arc<MemoryClipboard>) {
+        let (node, clip, _events) = start_node(dir).await;
         (node, clip)
+    }
+
+    async fn wait_for(events: &mut mpsc::UnboundedReceiver<Event>, pred: impl Fn(&Event) -> bool) -> Event {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let e = events.recv().await.expect("event stream ended");
+                if pred(&e) {
+                    return e;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for an event")
+    }
+
+    fn tmp_files(dir: &std::path::Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir.join("data").join("tmp")).unwrap().map(|e| e.unwrap().path()).collect()
+    }
+
+    #[tokio::test]
+    async fn start_removes_leftover_spills() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("data").join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("stale-clipboard.txt"), b"secret").unwrap();
+        let (_node, _clip) = node(dir.path()).await;
+        assert!(tmp_files(dir.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn oversized_pulls_spill_to_a_unique_file_per_serve() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, _clip) = node(dir.path()).await;
+        let big = "x".repeat(MAX_CLIP_BYTES as usize + 1);
+        let item = ClipItem::new(node.device_id(), ClipPayload::Text(big));
+        node.inner.history.lock().unwrap().insert(&item).unwrap();
+        // Nobody is connected, so both sends stay in their retry loop with the spill kept.
+        let peer = Uuid::new_v4();
+        node.inner.serve_pull(peer, item.id).await.unwrap();
+        node.inner.serve_pull(peer, item.id).await.unwrap();
+        let spills = tmp_files(dir.path());
+        assert_eq!(spills.len(), 2, "{spills:?}");
+        for spill in &spills {
+            assert_eq!(std::fs::metadata(spill).unwrap().len(), MAX_CLIP_BYTES + 1);
+        }
+        node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn catching_a_file_offer_tracks_no_pull() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let (a, _ca, mut a_events) = start_node(dir_a.path()).await;
+        let (b, _cb) = node(dir_b.path()).await;
+        let code = b.begin_pairing();
+        a.pair_with(b.local_addr().unwrap(), &code).await.unwrap();
+        wait_for(&mut a_events, |e| matches!(e, Event::PeerOnline { .. })).await;
+
+        let item_id = Uuid::new_v4();
+        a.inner.inbox.lock().unwrap().add(InboxEntry {
+            peer: b.device_id(),
+            item_id,
+            kind: ItemKind::File,
+            size: MAX_CLIP_BYTES + 1,
+            preview: Preview::File { name: "clipboard-1.txt".into() },
+            received: Instant::now(),
+        });
+        a.catch(item_id).await.unwrap();
+        assert!(a.inner.pulls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sends_stop_after_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, _clip, mut events) = start_node(dir.path()).await;
+        let spill = dir.path().join("data").join("tmp").join("spill.txt");
+        std::fs::write(&spill, b"data").unwrap();
+        node.shutdown();
+        let id = node.inner.spawn_send(Uuid::new_v4(), spill.clone(), "spill.txt".into(), true);
+        let failed = wait_for(&mut events, |e| matches!(e, Event::TransferFailed { .. })).await;
+        let Event::TransferFailed { transfer_id, reason, .. } = failed else { unreachable!() };
+        assert_eq!((transfer_id, reason.as_str()), (id, "shut down"));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!spill.exists());
+    }
+
+    #[tokio::test]
+    async fn no_dials_after_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, _clip) = node(dir.path()).await;
+        node.shutdown();
+        let peer = Uuid::new_v4();
+        node.inner.clone().dial(peer);
+        assert!(node.inner.dialing.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
