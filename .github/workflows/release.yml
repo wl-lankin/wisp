@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: windows-latest
+            args: ''
+          - os: macos-latest
+            args: '--target universal-apple-darwin'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/wisp/package-lock.json
+      - name: Install frontend dependencies
+        working-directory: apps/wisp
+        run: npm ci
+      - name: Check the tag matches the app version
+        working-directory: apps/wisp
+        shell: bash
+        run: |
+          npm run check-versions
+          test "v$(node -p "require('./package.json').version")" = "${GITHUB_REF_NAME}"
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: apps/wisp
+          tagName: ${{ github.ref_name }}
+          releaseName: Wisp ${{ github.ref_name }}
+          releaseBody: See the README for install notes. macOS builds are unsigned; right-click the app and choose Open the first time.
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
