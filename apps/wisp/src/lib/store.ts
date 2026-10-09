@@ -86,6 +86,11 @@ function transfer(s: State, id: string, peer: string): Transfer {
 export function reduce(s: State, e: EngineEvent): boolean {
   switch (e.type) {
     case 'engineRestarted':
+      for (const id of Object.keys(s.transfers)) {
+        const status = s.transfers[id].status
+        if (status === 'active' || status === 'paused') delete s.transfers[id]
+      }
+      s.identityWarnings = []
       return true
     case 'peerOnline': {
       const p = s.peers.find((x) => x.peer.deviceId === e.peer)
@@ -136,6 +141,7 @@ export function reduce(s: State, e: EngineEvent): boolean {
       return false
     case 'transferProgress': {
       const t = transfer(s, e.transferId, e.peer)
+      if (t.status === 'done' || t.status === 'failed') return false
       Object.assign(t, { name: e.name || t.name, done: e.done, total: e.total, outgoing: e.outgoing, status: 'active' })
       return false
     }
@@ -151,5 +157,83 @@ export function reduce(s: State, e: EngineEvent): boolean {
     case 'error':
       notify(s, 'error', e.message)
       return false
+  }
+}
+
+/** Puts offers back at the front of the inbox, newest first, without duplicates. */
+export function mergeOffers(s: State, offers: Offer[]): void {
+  if (offers.length === 0) return
+  const ids = new Set(offers.map((o) => o.itemId))
+  s.inbox = [...offers, ...s.inbox.filter((o) => !ids.has(o.itemId))]
+}
+
+export interface Resyncer {
+  request: () => Promise<void>
+  track: (e: EngineEvent) => void
+}
+
+/**
+ * Single-flight snapshot loader. Calls while a load is running collapse into one follow-up run.
+ * Offers that arrive while a snapshot is in flight are handed to `apply` so they are not wiped.
+ */
+export function createResyncer<T>(
+  fetch: () => Promise<T>,
+  apply: (snap: T, inFlightOffers: Offer[]) => void,
+  onGiveUp: () => void,
+  opts: { attempts?: number; delayMs?: number } = {},
+): Resyncer {
+  const attempts = opts.attempts ?? 40
+  const delayMs = opts.delayMs ?? 250
+  let running: Promise<void> | null = null
+  let dirty = false
+  let seen: Offer[] = []
+
+  async function load(): Promise<boolean> {
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      seen = []
+      try {
+        const snap = await fetch()
+        apply(snap, seen)
+        return true
+      } catch {
+        if (attempt < attempts - 1) await new Promise((r) => setTimeout(r, delayMs))
+      }
+    }
+    return false
+  }
+
+  async function loop(): Promise<void> {
+    try {
+      do {
+        dirty = false
+        if (!(await load())) {
+          dirty = false
+          onGiveUp()
+          return
+        }
+      } while (dirty)
+    } finally {
+      running = null
+    }
+  }
+
+  return {
+    request() {
+      if (running) {
+        dirty = true
+        return running
+      }
+      running = loop()
+      return running
+    },
+    track(e) {
+      if (!running) return
+      if (e.type === 'offerReceived') {
+        const { type: _type, ...offer } = e
+        seen = [offer, ...seen.filter((o) => o.itemId !== offer.itemId)]
+      } else if (e.type === 'clipboardApplied') {
+        seen = seen.filter((o) => o.itemId !== e.itemId)
+      }
+    },
   }
 }

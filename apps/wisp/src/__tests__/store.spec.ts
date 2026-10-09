@@ -100,4 +100,28 @@ describe('reduce', () => {
     expect(s.notices).toHaveLength(5)
     expect(s.notices[4].text).toBe('e7')
   })
+
+  it('forgets in-flight transfers and identity warnings when the engine restarts', () => {
+    const s = initialState()
+    applySnapshot(s, snap())
+    reduce(s, { type: 'transferProgress', transferId: 'a', peer: mac, name: 'a', done: 1, total: 2, outgoing: false })
+    reduce(s, { type: 'transferPaused', transferId: 'p', peer: mac })
+    reduce(s, { type: 'transferDone', transferId: 'd', peer: mac, path: null })
+    reduce(s, { type: 'identityChanged', peer: mac })
+    expect(reduce(s, { type: 'engineRestarted' })).toBe(true)
+    expect(Object.keys(s.transfers)).toEqual(['d'])
+    expect(s.identityWarnings).toEqual([])
+    reduce(s, { type: 'identityChanged', peer: mac })
+    expect(s.notices.filter((n) => n.kind === 'warning')).toHaveLength(2)
+  })
+
+  it('does not reopen a finished transfer on late progress', () => {
+    const s = initialState()
+    reduce(s, { type: 'transferDone', transferId: 't', peer: mac, path: 'x' })
+    reduce(s, { type: 'transferProgress', transferId: 't', peer: mac, name: 'a', done: 1, total: 2, outgoing: false })
+    expect(s.transfers.t.status).toBe('done')
+    reduce(s, { type: 'transferFailed', transferId: 'u', peer: mac, reason: 'r' })
+    reduce(s, { type: 'transferProgress', transferId: 'u', peer: mac, name: 'a', done: 1, total: 2, outgoing: false })
+    expect(s.transfers.u.status).toBe('failed')
+  })
 })
