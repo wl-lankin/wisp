@@ -2,6 +2,7 @@ mod commands;
 mod dto;
 mod engine;
 mod hotkey;
+mod screenshots;
 mod settings;
 mod tray;
 mod windows;
@@ -36,6 +37,8 @@ pub struct AppState {
     pub hotkey_busy: AtomicBool,
     /// Held for a whole settings change, so two quick saves cannot interleave and undo each other.
     pub settings_change: tokio::sync::Mutex<()>,
+    /// Watches the macOS screenshot folder while screenshot sharing is on.
+    pub screenshots: screenshots::ScreenshotService,
 }
 
 /// The newest clipboard write failure with a sequence number, until a later write succeeds.
@@ -108,6 +111,7 @@ pub(crate) async fn start_engine(app: &AppHandle) {
     if let Err(message) = state.engine.start(&settings, &state.paths, sink).await {
         let _ = app.emit("wisp://event", serde_json::json!({ "type": "error", "message": message }));
     }
+    state.screenshots.sync(app, settings.share_screenshot_files);
 }
 
 pub(crate) async fn catch_from_hotkey(app: &AppHandle) {
@@ -203,6 +207,7 @@ pub fn run() {
                 clipboard_error: Mutex::new(ClipboardErrorLog::default()),
                 hotkey_busy: AtomicBool::new(false),
                 settings_change: tokio::sync::Mutex::new(()),
+                screenshots: screenshots::ScreenshotService::default(),
             });
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -221,6 +226,8 @@ pub fn run() {
             commands::snapshot,
             commands::get_settings,
             commands::update_settings,
+            commands::rename_device,
+            commands::history_count,
             commands::complete_onboarding,
             commands::default_device_name,
             commands::pick_folder,

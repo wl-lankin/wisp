@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_HOTKEY: &str = "Ctrl+Alt+V";
+pub const DEFAULT_HISTORY_SIZE: u32 = 200;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -22,6 +23,8 @@ pub struct AppSettings {
     pub autostart: bool,
     pub theme: Theme,
     pub onboarded: bool,
+    pub history_size: u32,
+    pub share_screenshot_files: bool,
 }
 
 impl Default for AppSettings {
@@ -33,6 +36,8 @@ impl Default for AppSettings {
             autostart: true,
             theme: Theme::System,
             onboarded: false,
+            history_size: DEFAULT_HISTORY_SIZE,
+            share_screenshot_files: true,
         }
     }
 }
@@ -71,6 +76,8 @@ mod tests {
         assert_eq!(s.theme, Theme::System);
         assert!(!s.onboarded);
         assert_eq!(s.device_name, None);
+        assert_eq!(s.history_size, 200);
+        assert!(s.share_screenshot_files);
     }
 
     #[test]
@@ -84,6 +91,8 @@ mod tests {
             autostart: false,
             theme: Theme::Light,
             onboarded: true,
+            history_size: 500,
+            share_screenshot_files: false,
         };
         s.save(&path).unwrap();
         assert_eq!(AppSettings::load(&path), s);
@@ -100,5 +109,7 @@ mod tests {
         let s = AppSettings::load(&path);
         assert!(s.onboarded);
         assert_eq!(s.hotkey, DEFAULT_HOTKEY);
+        assert_eq!(s.history_size, 200);
+        assert!(s.share_screenshot_files);
     }
 }
