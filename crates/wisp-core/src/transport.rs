@@ -51,9 +51,18 @@ impl Transport {
         Ok(self.endpoint.local_addr()?)
     }
 
+    /// Accepts the next incoming connection.
+    ///
+    /// Trust contract: this returns connections for ANY client certificate. Callers must
+    /// authenticate the peer via `peer_fingerprint` against pinned peers (or run pairing)
+    /// before acting on any data. A handshake that does not complete within
+    /// `CONNECT_TIMEOUT` yields an error so a silent client cannot block later ones.
     pub async fn accept(&self) -> Option<Result<quinn::Connection>> {
         let incoming = self.endpoint.accept().await?;
-        Some(incoming.await.map_err(tls_err))
+        match tokio::time::timeout(CONNECT_TIMEOUT, incoming).await {
+            Ok(result) => Some(result.map_err(tls_err)),
+            Err(_) => Some(Err(CoreError::Transport("handshake timed out for incoming connection".into()))),
+        }
     }
 
     pub async fn connect(&self, addr: SocketAddr, expected: Option<Fingerprint>) -> Result<quinn::Connection> {
@@ -257,6 +266,17 @@ mod tests {
         tokio::spawn(async move { while let Some(_) = b.accept().await {} });
         let other = Identity::generate("Other").unwrap().fingerprint();
         assert!(a.connect(b_addr, Some(other)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn connect_without_expected_fingerprint_accepts_any_server() {
+        let a = Transport::bind(&Identity::generate("A").unwrap(), localhost()).unwrap();
+        let b_id = Identity::generate("B").unwrap();
+        let b = Transport::bind(&b_id, localhost()).unwrap();
+        let b_addr = b.local_addr().unwrap();
+        tokio::spawn(async move { while let Some(_) = b.accept().await {} });
+        let conn = a.connect(b_addr, None).await.unwrap();
+        assert_eq!(peer_fingerprint(&conn), Some(b_id.fingerprint()));
     }
 
     #[tokio::test]
