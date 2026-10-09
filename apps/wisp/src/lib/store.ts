@@ -174,11 +174,11 @@ export interface Resyncer {
 
 /**
  * Single-flight snapshot loader. Calls while a load is running collapse into one follow-up run.
- * Offers that arrive while a snapshot is in flight are handed to `apply` so they are not wiped.
+ * Offers that arrive while a snapshot is in flight, and ids caught meanwhile, are handed to `apply` so a stale snapshot cannot undo them.
  */
 export function createResyncer<T>(
   fetch: () => Promise<T>,
-  apply: (snap: T, inFlightOffers: Offer[]) => void,
+  apply: (snap: T, inFlightOffers: Offer[], removedIds: Set<string>) => void,
   onGiveUp: () => void,
   opts: { attempts?: number; delayMs?: number } = {},
 ): Resyncer {
@@ -187,13 +187,15 @@ export function createResyncer<T>(
   let running: Promise<void> | null = null
   let dirty = false
   let seen: Offer[] = []
+  let removed = new Set<string>()
 
   async function load(): Promise<boolean> {
     for (let attempt = 0; attempt < attempts; attempt++) {
       seen = []
+      removed = new Set()
       try {
         const snap = await fetch()
-        apply(snap, seen)
+        apply(snap, seen, removed)
         return true
       } catch {
         if (attempt < attempts - 1) await new Promise((r) => setTimeout(r, delayMs))
@@ -233,6 +235,7 @@ export function createResyncer<T>(
         seen = [offer, ...seen.filter((o) => o.itemId !== offer.itemId)]
       } else if (e.type === 'clipboardApplied') {
         seen = seen.filter((o) => o.itemId !== e.itemId)
+        removed.add(e.itemId)
       }
     },
   }

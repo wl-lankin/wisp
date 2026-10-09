@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { createResyncer } from '../lib/store'
+import { createResyncer, initialState, mergeOffers } from '../lib/store'
 import type { Offer } from '../lib/types'
 
 function offer(itemId: string): Offer {
@@ -71,7 +71,26 @@ describe('createResyncer', () => {
     const apply = vi.fn()
     const r2 = createResyncer<number>(fetch, apply, onGiveUp, { attempts: 3, delayMs: 1 })
     await r2.request()
-    expect(apply).toHaveBeenCalledWith(7, [])
+    expect(apply).toHaveBeenCalledWith(7, [], new Set())
     expect(onGiveUp).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps an offer caught during the fetch removed even if the snapshot still has it', async () => {
+    const gate = deferred<string>()
+    const s = initialState()
+    s.inbox = [offer('a'), offer('b')]
+    const r = createResyncer<string>(
+      () => gate.promise,
+      (_snap, offers, removed) => {
+        s.inbox = [offer('a'), offer('b')].filter((o) => !removed.has(o.itemId))
+        mergeOffers(s, offers)
+      },
+      vi.fn(),
+    )
+    const done = r.request()
+    r.track({ type: 'clipboardApplied', itemId: 'a', from: 'p' })
+    gate.resolve('snap')
+    await done
+    expect(s.inbox.map((o) => o.itemId)).toEqual(['b'])
   })
 })

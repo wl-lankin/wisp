@@ -22,8 +22,9 @@ export function useAppStore() {
 
   const resyncer = createResyncer(
     () => api.snapshot(),
-    (snap, inFlightOffers) => {
+    (snap, inFlightOffers, removedIds) => {
       applySnapshot(state, snap)
+      state.inbox = state.inbox.filter((o) => !removedIds.has(o.itemId))
       mergeOffers(state, inFlightOffers)
     },
     () => fail('Wisp is not responding. It will retry on the next change.'),
