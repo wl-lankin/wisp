@@ -4,5 +4,6 @@ pub mod item;
 pub mod pairing;
 pub mod peers;
 pub mod protocol;
+pub mod transport;
 
 pub use error::{CoreError, Result};
