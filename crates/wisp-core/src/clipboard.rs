@@ -147,11 +147,26 @@ impl ClipboardBackend for SystemClipboard {
 #[derive(Default)]
 pub struct EchoGuard {
     recent: VecDeque<([u8; 32], Instant)>,
+    pending_writes: usize,
 }
 
 impl EchoGuard {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Signals that Wisp is about to write to the clipboard; the monitor holds
+    /// off until the matching `end_write`.
+    pub fn begin_write(&mut self) {
+        self.pending_writes += 1;
+    }
+
+    pub fn end_write(&mut self) {
+        self.pending_writes = self.pending_writes.saturating_sub(1);
+    }
+
+    pub fn writing(&self) -> bool {
+        self.pending_writes > 0
     }
 
     pub fn mark_written(&mut self, hash: [u8; 32]) {
@@ -191,12 +206,26 @@ pub async fn write_and_mark(
     guard: &Mutex<EchoGuard>,
     payload: &ClipPayload,
 ) -> Result<()> {
+    guard.lock().unwrap().begin_write();
+    let _scope = WriteScope(guard);
     write_with_retry(backend, payload).await?;
-    guard.lock().unwrap().mark_written(payload.hash());
-    if let Ok(Some(readback)) = backend.read() {
-        guard.lock().unwrap().mark_written(readback.hash());
+    let readback = backend.read();
+    let mut g = guard.lock().unwrap();
+    g.mark_written(payload.hash());
+    if let Ok(Some(readback)) = readback {
+        g.mark_written(readback.hash());
     }
     Ok(())
+}
+
+/// Ends the pending-write window on every exit path, including panics and
+/// dropped futures.
+struct WriteScope<'a>(&'a Mutex<EchoGuard>);
+
+impl Drop for WriteScope<'_> {
+    fn drop(&mut self) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).end_write();
+    }
 }
 
 pub fn spawn_monitor(
@@ -212,6 +241,9 @@ pub fn spawn_monitor(
             ticker.tick().await;
             if tx.is_closed() {
                 break;
+            }
+            if guard.lock().unwrap().writing() {
+                continue;
             }
             let now = backend.change_count();
             if now == seen {
@@ -342,6 +374,42 @@ mod tests {
         write_and_mark(clip.as_ref(), &guard, &img).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(rx.try_recv().is_err());
+    }
+
+    struct SlowReencoding {
+        inner: Reencoding,
+    }
+
+    impl ClipboardBackend for SlowReencoding {
+        fn read(&self) -> Result<Option<ClipPayload>> {
+            self.inner.read()
+        }
+        fn write(&self, payload: &ClipPayload) -> Result<()> {
+            self.inner.write(payload)?;
+            std::thread::sleep(Duration::from_millis(50));
+            Ok(())
+        }
+        fn change_count(&self) -> u64 {
+            self.inner.change_count()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn monitor_holds_off_while_wisp_is_writing() {
+        let clip = Arc::new(SlowReencoding { inner: Reencoding { inner: MemoryClipboard::new() } });
+        let guard = Arc::new(Mutex::new(EchoGuard::new()));
+        let mut rx = spawn_monitor(clip.clone(), guard.clone(), Duration::from_millis(10));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let img = ClipPayload::Image { png: vec![1, 2, 3], width: 1, height: 1 };
+        write_and_mark(clip.as_ref(), &guard, &img).await.unwrap();
+        assert!(!guard.lock().unwrap().writing());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(rx.try_recv().is_err());
+
+        clip.inner.inner.set_external(ClipPayload::Text("user copy".into()));
+        let got = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.unwrap().unwrap();
+        assert_eq!(got, ClipPayload::Text("user copy".into()));
     }
 
     #[tokio::test]
