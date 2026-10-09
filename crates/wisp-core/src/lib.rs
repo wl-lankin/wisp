@@ -5,6 +5,7 @@ pub mod identity;
 pub mod item;
 pub mod pairing;
 pub mod peers;
+pub mod policy;
 pub mod protocol;
 pub mod transport;
 
