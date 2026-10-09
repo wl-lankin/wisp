@@ -1,6 +1,7 @@
 pub mod error;
 pub mod identity;
 pub mod item;
+pub mod pairing;
 pub mod peers;
 pub mod protocol;
 

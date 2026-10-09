@@ -1,3 +1,4 @@
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
@@ -25,8 +26,8 @@ pub enum Message {
     Pong { nonce: u64 },
 }
 
-pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, msg: &Message) -> Result<()> {
-    let bytes = postcard::to_allocvec(msg)?;
+pub async fn write_value<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, value: &T) -> Result<()> {
+    let bytes = postcard::to_allocvec(value)?;
     if bytes.len() > MAX_FRAME {
         return Err(CoreError::Frame(format!("frame of {} bytes exceeds limit", bytes.len())));
     }
@@ -36,7 +37,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, msg: &Message) -> Res
     Ok(())
 }
 
-pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Message> {
+pub async fn read_value<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) -> Result<T> {
     let len = r.read_u32().await? as usize;
     if len > MAX_FRAME {
         return Err(CoreError::Frame(format!("frame of {len} bytes exceeds limit")));
@@ -44,6 +45,14 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Message> {
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf).await?;
     Ok(postcard::from_bytes(&buf)?)
+}
+
+pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, msg: &Message) -> Result<()> {
+    write_value(w, msg).await
+}
+
+pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Message> {
+    read_value(r).await
 }
 
 #[cfg(test)]
