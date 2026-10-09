@@ -4,3 +4,5 @@ dist/
 apps/wisp/node_modules/
 apps/wisp/dist/
 apps/wisp/src-tauri/gen/
+apps/wisp/src-tauri/icons/android/
+apps/wisp/src-tauri/icons/ios/
