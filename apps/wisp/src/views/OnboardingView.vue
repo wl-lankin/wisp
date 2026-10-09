@@ -9,6 +9,7 @@ const step = ref<'name' | 'pair'>('name')
 const name = ref('')
 const error = ref('')
 const busy = ref(false)
+const card = ref<InstanceType<typeof PairingCard> | null>(null)
 let disposed = false
 
 function friendly(e: unknown): string {
@@ -49,6 +50,7 @@ async function next() {
 
 async function done() {
   error.value = ''
+  card.value?.cancel()
   try {
     await api.openWindow('panel')
     await api.hideWindow('onboarding')
@@ -84,7 +86,7 @@ async function done() {
 
     <section v-else class="flex flex-1 flex-col gap-4 overflow-y-auto">
       <p class="text-[14px] text-[var(--muted)]">Now connect your other computer. Install Wisp there too, then pair with a code.</p>
-      <PairingCard />
+      <PairingCard ref="card" />
       <p v-if="onWindows()" class="text-[12px] text-[var(--muted)]">If Windows asks whether Wisp may use the network, allow it on private networks.</p>
       <p v-if="error" class="text-[12px] text-[var(--danger)]" role="alert">{{ error }}</p>
       <button class="hoverable mt-auto self-end rounded-xl border border-[var(--border)] px-5 py-2.5 hover:bg-[var(--surface-strong)]" @click="done">Done</button>

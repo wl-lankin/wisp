@@ -261,6 +261,21 @@ fn on_panel_blur(app: &AppHandle) {
     hide_by_blur(app);
 }
 
+/// A pairing code belongs to the window showing it, so closing that window ends the code.
+fn ends_pairing(view: View) -> bool {
+    matches!(view, View::Settings | View::Onboarding)
+}
+
+fn cancel_pairing(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        // While the engine is still starting there is no code to cancel.
+        if let Ok(node) = app.state::<AppState>().engine.node().await {
+            node.cancel_pairing();
+        }
+    });
+}
+
 pub fn show(app: &AppHandle, view: View) -> tauri::Result<WebviewWindow> {
     let window = match app.get_webview_window(view.label()) {
         Some(w) => w,
@@ -281,6 +296,14 @@ pub fn show(app: &AppHandle, view: View) -> tauri::Result<WebviewWindow> {
                     _ => {}
                 });
             }
+            if ends_pairing(view) {
+                let handle = app.clone();
+                w.on_window_event(move |event| {
+                    if matches!(event, WindowEvent::CloseRequested { .. } | WindowEvent::Destroyed) {
+                        cancel_pairing(&handle);
+                    }
+                });
+            }
             w
         }
     };
@@ -298,6 +321,9 @@ pub fn show(app: &AppHandle, view: View) -> tauri::Result<WebviewWindow> {
 pub fn hide(app: &AppHandle, view: View) {
     if let Some(w) = app.get_webview_window(view.label()) {
         let _ = w.hide();
+    }
+    if ends_pairing(view) {
+        cancel_pairing(app);
     }
 }
 

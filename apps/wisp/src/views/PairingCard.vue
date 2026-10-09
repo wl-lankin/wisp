@@ -1,10 +1,13 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
-import { api } from '../lib/api'
+import type { UnlistenFn } from '@tauri-apps/api/event'
+import { api, onEngineEvent } from '../lib/api'
 import { useAppStore } from '../lib/appStore'
 import { findNewPeers, formatCode, friendlyPairingError, normalizeCode } from '../lib/pairing'
 
 const { state } = useAppStore()
+/** A code that nobody used for this long is cancelled, so it never outlives what the person sees. */
+const CODE_LIFETIME_MS = 5 * 60 * 1000
 const tab = ref<'show' | 'enter'>('show')
 const code = ref<string | null>(null)
 const knownPeerIds = ref<Set<string>>(new Set())
@@ -16,6 +19,21 @@ const typedCode = ref('')
 const pairing = ref(false)
 let disposed = false
 let showRequest = 0
+let expiryTimer: ReturnType<typeof setTimeout> | undefined
+let unlisten: UnlistenFn | undefined
+
+function clearExpiry() {
+  clearTimeout(expiryTimer)
+  expiryTimer = undefined
+}
+
+function expire() {
+  clearExpiry()
+  if (!code.value) return
+  code.value = null
+  void api.cancelPairing().catch(() => undefined)
+  error.value = 'This code expired. Show a new one when you are ready.'
+}
 
 const address = computed(() => typedAddress.value.trim() || target.value)
 
@@ -32,6 +50,8 @@ async function showCode() {
       return
     }
     code.value = created
+    clearExpiry()
+    expiryTimer = setTimeout(expire, CODE_LIFETIME_MS)
   } catch (e) {
     if (!disposed && request === showRequest) error.value = friendlyPairingError(e)
   }
@@ -45,12 +65,14 @@ watch(
     if (added.length === 0) return
     success.value = added[added.length - 1].peer.name
     code.value = null
+    clearExpiry()
   },
   { deep: true },
 )
 
 function leaveShowTab() {
   showRequest++
+  clearExpiry()
   if (code.value) void api.cancelPairing().catch(() => undefined)
   code.value = null
 }
@@ -59,7 +81,6 @@ watch(tab, (next, prev) => {
   if (prev === 'show') leaveShowTab()
   error.value = ''
   success.value = null
-  if (next === 'show') void showCode()
 })
 
 async function pair() {
@@ -91,9 +112,27 @@ function pick(addr: string | undefined) {
   typedAddress.value = ''
 }
 
-void showCode()
+onEngineEvent((e) => {
+  if (disposed || e.type !== 'pairingFailed' || tab.value !== 'show' || !code.value) return
+  code.value = null
+  clearExpiry()
+  error.value = friendlyPairingError(e.reason)
+})
+  .then((off) => {
+    if (disposed) off()
+    else unlisten = off
+  })
+  .catch(() => undefined)
+
+/** Ends a live code. Used by the parent when its window is about to close. */
+function cancel() {
+  leaveShowTab()
+}
+defineExpose({ cancel })
+
 onBeforeUnmount(() => {
   disposed = true
+  unlisten?.()
   leaveShowTab()
 })
 </script>
@@ -110,8 +149,8 @@ onBeforeUnmount(() => {
     <template v-else-if="tab === 'show'">
       <p class="text-[var(--muted)]">On your other device, open Wisp, choose "Enter a code" and type:</p>
       <p v-if="code" class="accent-text my-4 text-center font-mono text-4xl font-semibold tracking-[0.2em]">{{ formatCode(code) }}</p>
-      <p class="text-[11px] text-[var(--muted)]">Waiting for the other device. Three wrong tries end this code.</p>
-      <button v-if="!code" class="hoverable mt-2 rounded-lg border border-[var(--border)] px-3 py-1.5" @click="showCode">New code</button>
+      <p v-if="code" class="text-[11px] text-[var(--muted)]">Waiting for the other device. Three wrong tries end this code.</p>
+      <button v-if="!code" class="hoverable mt-2 rounded-lg border border-[var(--border)] px-3 py-1.5" @click="showCode">Show a code</button>
     </template>
 
     <template v-else>

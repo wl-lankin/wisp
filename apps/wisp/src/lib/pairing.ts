@@ -20,9 +20,10 @@ export function friendlyPairingError(e: unknown): string {
   const text = raw.toLowerCase()
   if (text.includes('too many wrong codes')) return 'Too many wrong codes. Start pairing again on the other device.'
   if (text.includes('wrong code')) return 'That code did not match. Check the digits on the other device and try again.'
+  if (text.includes('presented our own identity')) return 'That is this device. Pair with your other computer.'
   if (text.includes('already paired')) return 'These devices are already paired.'
   if (text.includes('session has ended')) return 'The code expired. Show a new code and try again.'
-  if (/timed out|transport|io:|connect|refused|unreachable|network/.test(text)) {
+  if (/^(io|transport):/.test(text) || /timed out|connection (refused|lost|reset)|unreachable|no route|network is/.test(text)) {
     return 'Could not reach that address. Check the IP address and that Wisp is open on the other device.'
   }
   return raw || 'Pairing did not work. Please try again.'

@@ -44,6 +44,17 @@ describe('friendlyPairingError', () => {
       expect(friendlyPairingError(raw)).toMatch(/could not reach/i)
     }
   })
+  it('explains pairing with this very device', () => {
+    expect(friendlyPairingError('pairing: peer presented our own identity')).toBe('That is this device. Pair with your other computer.')
+  })
+  it('explains already paired and ended sessions', () => {
+    expect(friendlyPairingError('pairing: 1234 is already paired')).toMatch(/already paired/i)
+    expect(friendlyPairingError('The pairing session has ended. Start pairing again.')).toMatch(/expired/i)
+  })
+  it('does not call unrelated text unreachable', () => {
+    expect(friendlyPairingError('pairing: key exchange failed: Reflected')).not.toMatch(/could not reach/i)
+    expect(friendlyPairingError('pairing: connectivity of the moon')).not.toMatch(/could not reach/i)
+  })
   it('keeps already friendly messages and strips the Error prefix', () => {
     expect(friendlyPairingError(new Error('"abc" is not an IP address'))).toBe('"abc" is not an IP address')
   })
