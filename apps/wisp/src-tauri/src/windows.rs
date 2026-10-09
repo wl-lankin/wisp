@@ -318,6 +318,24 @@ pub fn show(app: &AppHandle, view: View) -> tauri::Result<WebviewWindow> {
     Ok(window)
 }
 
+/// The view an entry point (tray click, tray menu, second launch) should open: first run comes first.
+pub fn entry_view(onboarded: bool, requested: View) -> View {
+    if onboarded {
+        requested
+    } else {
+        View::Onboarding
+    }
+}
+
+fn is_onboarded(app: &AppHandle) -> bool {
+    app.try_state::<AppState>().is_none_or(|state| state.settings.lock().unwrap().onboarded)
+}
+
+/// Opens `requested` from a tray or launch entry point, or onboarding while first run is not done.
+pub fn show_entry(app: &AppHandle, requested: View) {
+    let _ = show(app, entry_view(is_onboarded(app), requested));
+}
+
 pub fn hide(app: &AppHandle, view: View) {
     if let Some(w) = app.get_webview_window(view.label()) {
         let _ = w.hide();
@@ -328,6 +346,10 @@ pub fn hide(app: &AppHandle, view: View) {
 }
 
 pub fn toggle_panel(app: &AppHandle) {
+    if !is_onboarded(app) {
+        show_entry(app, View::Panel);
+        return;
+    }
     let blurred_at = app.state::<AppState>().panel_blurred_at.lock().unwrap().take();
     if blurred_at.is_some_and(|at| at.elapsed() < BLUR_CLICK_WINDOW) {
         // The press on the tray icon already hid the panel; this click was meant to close it.
@@ -364,6 +386,14 @@ mod tests {
             assert_eq!(v.url(), format!("index.html?view={}", v.label()));
         }
         assert_eq!(View::from_label("nope"), None);
+    }
+
+    #[test]
+    fn every_entry_point_shows_onboarding_until_it_is_done() {
+        for v in [View::Panel, View::Timeline, View::Settings] {
+            assert_eq!(entry_view(false, v), View::Onboarding);
+            assert_eq!(entry_view(true, v), v);
+        }
     }
 
     #[test]

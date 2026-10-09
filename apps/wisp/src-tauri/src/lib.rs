@@ -32,6 +32,8 @@ pub struct AppState {
     pub hotkey_error: Mutex<Option<String>>,
     /// True while a shortcut press is being handled, so a held key does not stack catches.
     pub hotkey_busy: AtomicBool,
+    /// Held for a whole settings change, so two quick saves cannot interleave and undo each other.
+    pub settings_change: tokio::sync::Mutex<()>,
 }
 
 struct TauriSink {
@@ -48,11 +50,11 @@ impl EventSink for TauriSink {
             Event::OfferReceived(_) => {
                 let _ = windows::show(&self.app, windows::View::Toast);
                 let app = self.app.clone();
-                tauri::async_runtime::spawn(async move { tray::refresh(&app).await });
+                tauri::async_runtime::spawn(async move { tray::inbox_changed(&app).await });
             }
             Event::ClipboardApplied { .. } => {
                 let app = self.app.clone();
-                tauri::async_runtime::spawn(async move { tray::refresh(&app).await });
+                tauri::async_runtime::spawn(async move { tray::inbox_changed(&app).await });
             }
             _ => {}
         }
@@ -91,7 +93,7 @@ async fn catch_newest_or_show_panel(app: &AppHandle) {
             let _ = app.emit("wisp://event", serde_json::json!({ "type": "error", "message": e.to_string() }));
         }
     }
-    tray::refresh(app).await;
+    tray::inbox_changed(app).await;
 }
 
 pub(crate) fn set_hotkey_error(app: &AppHandle, problem: Option<String>) {
@@ -136,9 +138,7 @@ fn adopt_system_autostart(app: &AppHandle) {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            let onboarded = app.try_state::<AppState>().is_none_or(|state| state.settings.lock().unwrap().onboarded);
-            let view = if onboarded { windows::View::Panel } else { windows::View::Onboarding };
-            let _ = windows::show(app, view);
+            windows::show_entry(app, windows::View::Panel);
         }))
         .plugin(hotkey::plugin())
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
@@ -161,6 +161,7 @@ pub fn run() {
                 panel_blurred_at: Mutex::new(None),
                 hotkey_error: Mutex::new(None),
                 hotkey_busy: AtomicBool::new(false),
+                settings_change: tokio::sync::Mutex::new(()),
             });
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);

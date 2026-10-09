@@ -75,6 +75,7 @@ fn roll_back_hotkey(app: &AppHandle, registered: bool, previous: &AppSettings, n
 
 #[tauri::command]
 pub async fn update_settings(app: AppHandle, state: State<'_, AppState>, mut next: AppSettings) -> Cmd<AppSettings> {
+    let _change = state.settings_change.lock().await;
     if let Some(name) = next.device_name.take() {
         let name = name.trim();
         if name.is_empty() {
@@ -123,6 +124,7 @@ pub async fn complete_onboarding(app: AppHandle, state: State<'_, AppState>, dev
     if name.is_empty() {
         return Err("Please give this device a name".into());
     }
+    let _change = state.settings_change.lock().await;
     let mut next = state.settings.lock().unwrap().clone();
     next.device_name = Some(name.chars().take(64).collect());
     next.onboarded = true;
@@ -167,33 +169,42 @@ pub async fn pair_with(state: State<'_, AppState>, addr: String, code: String) -
 }
 
 #[tauri::command]
-pub async fn set_mode(state: State<'_, AppState>, peer: Uuid, mode: DeliveryMode) -> Cmd<()> {
-    state.engine.node().await?.set_mode(peer, mode).map_err(err)
+pub async fn set_mode(app: AppHandle, state: State<'_, AppState>, peer: Uuid, mode: DeliveryMode) -> Cmd<()> {
+    state.engine.node().await?.set_mode(peer, mode).map_err(err)?;
+    peers_changed(&app);
+    Ok(())
 }
 
 #[tauri::command]
-pub async fn forget(state: State<'_, AppState>, peer: Uuid) -> Cmd<()> {
-    state.engine.node().await?.forget(peer).map_err(err)
+pub async fn forget(app: AppHandle, state: State<'_, AppState>, peer: Uuid) -> Cmd<()> {
+    state.engine.node().await?.forget(peer).map_err(err)?;
+    peers_changed(&app);
+    Ok(())
+}
+
+/// The engine has no event for these changes, so every window is told to reload its peers.
+fn peers_changed(app: &AppHandle) {
+    let _ = app.emit("wisp://event", serde_json::json!({ "type": "peersChanged" }));
 }
 
 #[tauri::command]
 pub async fn catch(app: AppHandle, state: State<'_, AppState>, item_id: Uuid) -> Cmd<()> {
     let result = state.engine.node().await?.catch(item_id).await.map_err(err);
-    crate::tray::refresh(&app).await;
+    crate::tray::inbox_changed(&app).await;
     result
 }
 
 #[tauri::command]
 pub async fn catch_latest(app: AppHandle, state: State<'_, AppState>) -> Cmd<Option<Uuid>> {
     let result = state.engine.node().await?.catch_latest().await.map_err(err);
-    crate::tray::refresh(&app).await;
+    crate::tray::inbox_changed(&app).await;
     result
 }
 
 #[tauri::command]
 pub async fn dismiss(app: AppHandle, state: State<'_, AppState>, item_id: Uuid) -> Cmd<()> {
     state.engine.node().await?.dismiss(item_id);
-    crate::tray::refresh(&app).await;
+    crate::tray::inbox_changed(&app).await;
     Ok(())
 }
 
@@ -210,7 +221,7 @@ pub async fn save_offer(app: AppHandle, state: State<'_, AppState>, item_id: Uui
     let kind = node.inbox().iter().find(|o| o.item_id == item_id).map(|o| o.kind);
     let kind = kind.ok_or_else(|| "This offer is no longer available".to_string())?;
     let caught = node.catch(item_id).await.map_err(err);
-    crate::tray::refresh(&app).await;
+    crate::tray::inbox_changed(&app).await;
     caught?;
     let dir = save_dir(&state);
     if kind == ItemKind::File {

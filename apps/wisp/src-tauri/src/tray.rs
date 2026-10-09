@@ -1,7 +1,7 @@
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::windows::{self, View};
 use crate::AppState;
@@ -49,15 +49,9 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
-            "open" => {
-                let _ = windows::show(app, View::Panel);
-            }
-            "timeline" => {
-                let _ = windows::show(app, View::Timeline);
-            }
-            "pair" | "settings" => {
-                let _ = windows::show(app, View::Settings);
-            }
+            "open" => windows::show_entry(app, View::Panel),
+            "timeline" => windows::show_entry(app, View::Timeline),
+            "pair" | "settings" => windows::show_entry(app, View::Settings),
             "quit" => {
                 let handle = app.clone();
                 tauri::async_runtime::spawn(async move {
@@ -77,8 +71,15 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+/// Tells the tray and every window that the inbox changed, so a caught, dismissed or saved offer
+/// disappears everywhere and not only in the window that acted on it.
+pub async fn inbox_changed(app: &AppHandle) {
+    refresh(app).await;
+    let _ = app.emit("wisp://event", serde_json::json!({ "type": "inboxChanged" }));
+}
+
 /// Shows the pending dot while uncaught offers wait in the inbox.
-pub async fn refresh(app: &AppHandle) {
+async fn refresh(app: &AppHandle) {
     let pending = match app.state::<AppState>().engine.node().await {
         Ok(node) => !node.inbox().is_empty(),
         Err(_) => false,
