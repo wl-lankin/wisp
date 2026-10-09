@@ -17,6 +17,8 @@ const target = ref('')
 const typedAddress = ref('')
 const typedCode = ref('')
 const pairing = ref(false)
+/** True while a code is being created, so a quick double click cannot ask for two. */
+const starting = ref(false)
 let disposed = false
 let showRequest = 0
 let expiryTimer: ReturnType<typeof setTimeout> | undefined
@@ -38,6 +40,8 @@ function expire() {
 const address = computed(() => typedAddress.value.trim() || target.value)
 
 async function showCode() {
+  if (starting.value) return
+  starting.value = true
   const request = ++showRequest
   error.value = ''
   success.value = null
@@ -54,6 +58,8 @@ async function showCode() {
     expiryTimer = setTimeout(expire, CODE_LIFETIME_MS)
   } catch (e) {
     if (!disposed && request === showRequest) error.value = friendlyPairingError(e)
+  } finally {
+    starting.value = false
   }
 }
 
@@ -150,7 +156,7 @@ onBeforeUnmount(() => {
       <p class="text-[var(--muted)]">On your other device, open Wisp, choose "Enter a code" and type:</p>
       <p v-if="code" class="accent-text my-4 text-center font-mono text-4xl font-semibold tracking-[0.2em]">{{ formatCode(code) }}</p>
       <p v-if="code" class="text-[11px] text-[var(--muted)]">Waiting for the other device. Three wrong tries end this code.</p>
-      <button v-if="!code" class="hoverable mt-2 rounded-lg border border-[var(--border)] px-3 py-1.5" @click="showCode">Show a code</button>
+      <button v-if="!code" class="hoverable mt-2 rounded-lg border border-[var(--border)] px-3 py-1.5" :disabled="starting" @click="showCode">Show a code</button>
     </template>
 
     <template v-else>

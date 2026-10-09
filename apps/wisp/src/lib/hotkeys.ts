@@ -36,7 +36,3 @@ export function comboProblem(combo: string): string | null {
   }
   return null
 }
-
-export function isAllowedCombo(combo: string): boolean {
-  return comboProblem(combo) === null
-}

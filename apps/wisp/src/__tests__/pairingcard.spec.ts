@@ -85,6 +85,22 @@ describe('PairingCard', () => {
     expect(api.cancelPairing).toHaveBeenCalledTimes(1)
   })
 
+  it('asks for one code even when the button is clicked twice quickly', async () => {
+    const { api, PairingCard } = await load()
+    let resolve: (c: string) => void = () => {}
+    api.beginPairing.mockReturnValue(new Promise<string>((r) => (resolve = r)))
+    api.cancelPairing.mockResolvedValue(undefined)
+    const w = mount(PairingCard)
+    await flushPromises()
+    await actionButton(w).trigger('click')
+    await actionButton(w).trigger('click')
+    expect(api.beginPairing).toHaveBeenCalledTimes(1)
+    resolve('111222')
+    await flushPromises()
+    expect(w.text()).toContain('111 222')
+    w.unmount()
+  })
+
   it('cancels a code that arrives after unmount', async () => {
     const { api, PairingCard } = await load()
     let resolve: (c: string) => void = () => {}
