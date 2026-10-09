@@ -7,7 +7,7 @@ mod tray;
 mod windows;
 
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -28,6 +28,10 @@ pub struct AppState {
     pub tray_rect: Mutex<Option<windows::Rect>>,
     /// When the panel last hid because it lost focus, so the tray click that caused it closes it.
     pub panel_blurred_at: Mutex<Option<Instant>>,
+    /// Why the catch shortcut is not registered, shown in the UI until a later registration succeeds.
+    pub hotkey_error: Mutex<Option<String>>,
+    /// True while a shortcut press is being handled, so a held key does not stack catches.
+    pub hotkey_busy: AtomicBool,
 }
 
 struct TauriSink {
@@ -65,7 +69,19 @@ pub(crate) async fn start_engine(app: &AppHandle) {
 }
 
 pub(crate) async fn catch_from_hotkey(app: &AppHandle) {
-    let Ok(node) = app.state::<AppState>().engine.node().await else { return };
+    let state = app.state::<AppState>();
+    if state.hotkey_busy.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    catch_newest_or_show_panel(app).await;
+    state.hotkey_busy.store(false, Ordering::Release);
+}
+
+async fn catch_newest_or_show_panel(app: &AppHandle) {
+    let Ok(node) = app.state::<AppState>().engine.node().await else {
+        let _ = windows::show(app, windows::View::Panel);
+        return;
+    };
     match node.catch_latest().await {
         Ok(Some(_)) => {}
         Ok(None) => {
@@ -78,17 +94,42 @@ pub(crate) async fn catch_from_hotkey(app: &AppHandle) {
     tray::refresh(app).await;
 }
 
-pub(crate) fn sync_system_integration(app: &AppHandle, settings: &AppSettings) {
-    use tauri_plugin_autostart::ManagerExt;
-    if let Err(message) = hotkey::apply(app, None, &settings.hotkey) {
-        let _ = app.emit("wisp://event", serde_json::json!({ "type": "error", "message": format!("{message}. Change it in Settings.") }));
+pub(crate) fn set_hotkey_error(app: &AppHandle, problem: Option<String>) {
+    *app.state::<AppState>().hotkey_error.lock().unwrap() = problem;
+}
+
+/// Registers the saved shortcut. A conflict is kept in the state because no window can show an event this early.
+pub(crate) fn register_saved_hotkey(app: &AppHandle, settings: &AppSettings) {
+    match hotkey::apply(app, None, &settings.hotkey) {
+        Ok(()) => set_hotkey_error(app, None),
+        Err(message) => {
+            let problem = format!("{message}. Change it in Settings.");
+            let _ = app.emit("wisp://event", serde_json::json!({ "type": "error", "message": problem }));
+            set_hotkey_error(app, Some(problem));
+        }
     }
+}
+
+/// Turns start at login on or off in the system.
+pub(crate) fn apply_autostart(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
     let launcher = app.autolaunch();
-    let enabled = launcher.is_enabled().unwrap_or(false);
-    if settings.autostart && !enabled {
-        let _ = launcher.enable();
-    } else if !settings.autostart && enabled {
-        let _ = launcher.disable();
+    let result = if enabled { launcher.enable() } else { launcher.disable() };
+    result.map_err(|e| format!("Could not change start at login ({e})"))
+}
+
+/// Follows a change the user made in the system (for example in Task Manager) instead of overriding it.
+fn adopt_system_autostart(app: &AppHandle) {
+    use tauri_plugin_autostart::ManagerExt;
+    let Ok(enabled) = app.autolaunch().is_enabled() else { return };
+    let state = app.state::<AppState>();
+    let mut next = state.settings.lock().unwrap().clone();
+    if next.autostart == enabled {
+        return;
+    }
+    next.autostart = enabled;
+    if let Err(e) = commands::save_settings(app, &state, next) {
+        tracing::warn!("could not remember the start at login choice: {e}");
     }
 }
 
@@ -116,12 +157,15 @@ pub fn run() {
                 dragging: AtomicBool::new(false),
                 tray_rect: Mutex::new(None),
                 panel_blurred_at: Mutex::new(None),
+                hotkey_error: Mutex::new(None),
+                hotkey_busy: AtomicBool::new(false),
             });
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             tray::install(app.handle())?;
             if onboarded {
-                sync_system_integration(app.handle(), &startup_settings);
+                register_saved_hotkey(app.handle(), &startup_settings);
+                adopt_system_autostart(app.handle());
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move { start_engine(&handle).await });
             } else {

@@ -124,4 +124,13 @@ describe('reduce', () => {
     reduce(s, { type: 'transferProgress', transferId: 'u', peer: mac, name: 'a', done: 1, total: 2, outgoing: false })
     expect(s.transfers.u.status).toBe('failed')
   })
+  it('shows a startup shortcut problem once as a warning', () => {
+    const s = initialState()
+    applySnapshot(s, { ...snap(), hotkeyError: 'Ctrl+Alt+V could not be registered' })
+    applySnapshot(s, { ...snap(), hotkeyError: 'Ctrl+Alt+V could not be registered' })
+    expect(s.notices.filter((n) => n.text.includes('could not be registered'))).toHaveLength(1)
+    expect(s.notices[0].kind).toBe('warning')
+    applySnapshot(s, { ...snap(), hotkeyError: null })
+    expect(s.notices).toHaveLength(1)
+  })
 })

@@ -34,6 +34,7 @@ pub struct Snapshot {
     peers: Vec<PeerStatus>,
     nearby: Vec<NearbyDevice>,
     inbox: Vec<Value>,
+    hotkey_error: Option<String>,
 }
 
 #[tauri::command]
@@ -47,6 +48,7 @@ pub async fn snapshot(state: State<'_, AppState>) -> Cmd<Snapshot> {
         peers: node.peers(),
         nearby: node.nearby(),
         inbox: node.inbox().iter().map(|o| with_ui_preview(o, &o.preview)).collect(),
+        hotkey_error: state.hotkey_error.lock().unwrap().clone(),
     })
 }
 
@@ -55,7 +57,7 @@ pub fn get_settings(state: State<'_, AppState>) -> AppSettings {
     state.settings.lock().unwrap().clone()
 }
 
-fn save_settings(app: &AppHandle, state: &AppState, next: AppSettings) -> Cmd<AppSettings> {
+pub(crate) fn save_settings(app: &AppHandle, state: &AppState, next: AppSettings) -> Cmd<AppSettings> {
     {
         let mut current = state.settings.lock().unwrap();
         next.save(&state.settings_path)?;
@@ -65,9 +67,14 @@ fn save_settings(app: &AppHandle, state: &AppState, next: AppSettings) -> Cmd<Ap
     Ok(next)
 }
 
+fn roll_back_hotkey(app: &AppHandle, registered: bool, previous: &AppSettings, next: &AppSettings) {
+    if registered && previous.hotkey != next.hotkey {
+        let _ = crate::hotkey::apply(app, Some(&next.hotkey), &previous.hotkey);
+    }
+}
+
 #[tauri::command]
 pub async fn update_settings(app: AppHandle, state: State<'_, AppState>, mut next: AppSettings) -> Cmd<AppSettings> {
-    use tauri_plugin_autostart::ManagerExt;
     if let Some(name) = next.device_name.take() {
         let name = name.trim();
         if name.is_empty() {
@@ -76,15 +83,34 @@ pub async fn update_settings(app: AppHandle, state: State<'_, AppState>, mut nex
         next.device_name = Some(name.chars().take(64).collect());
     }
     let previous = state.settings.lock().unwrap().clone();
-    if next.hotkey != previous.hotkey {
-        crate::hotkey::apply(&app, Some(&previous.hotkey), &next.hotkey)?;
+    crate::hotkey::parse(&next.hotkey)?;
+    // Re-saving an unchanged shortcut re-registers it when something else released it.
+    let register_hotkey = previous.onboarded;
+    if register_hotkey {
+        match crate::hotkey::apply(&app, Some(&previous.hotkey), &next.hotkey) {
+            Ok(()) => crate::set_hotkey_error(&app, None),
+            Err(e) if next.hotkey != previous.hotkey => return Err(e),
+            // An unchanged shortcut that is still taken must not block unrelated settings.
+            Err(_) => {}
+        }
     }
-    if next.autostart != previous.autostart {
-        let launcher = app.autolaunch();
-        let result = if next.autostart { launcher.enable() } else { launcher.disable() };
-        result.map_err(|e| format!("Could not change start at login ({e})"))?;
+    let autostart_changed = next.autostart != previous.autostart;
+    if autostart_changed {
+        if let Err(e) = crate::apply_autostart(&app, next.autostart) {
+            roll_back_hotkey(&app, register_hotkey, &previous, &next);
+            return Err(e);
+        }
     }
-    let saved = save_settings(&app, &state, next)?;
+    let saved = match save_settings(&app, &state, next.clone()) {
+        Ok(saved) => saved,
+        Err(e) => {
+            roll_back_hotkey(&app, register_hotkey, &previous, &next);
+            if autostart_changed {
+                let _ = crate::apply_autostart(&app, previous.autostart);
+            }
+            return Err(e);
+        }
+    };
     if saved.onboarded && saved.save_dir != previous.save_dir {
         crate::start_engine(&app).await;
     }
@@ -102,7 +128,10 @@ pub async fn complete_onboarding(app: AppHandle, state: State<'_, AppState>, dev
     next.onboarded = true;
     let saved = save_settings(&app, &state, next)?;
     crate::start_engine(&app).await;
-    crate::sync_system_integration(&app, &saved);
+    crate::register_saved_hotkey(&app, &saved);
+    if let Err(message) = crate::apply_autostart(&app, saved.autostart) {
+        let _ = app.emit("wisp://event", serde_json::json!({ "type": "error", "message": message }));
+    }
     crate::windows::hide(&app, View::Onboarding);
     let _ = crate::windows::show(&app, View::Panel);
     Ok(())

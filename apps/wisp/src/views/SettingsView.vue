@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { api } from '../lib/api'
 import { useAppStore } from '../lib/appStore'
-import { comboFromEvent, displayCombo } from '../lib/hotkeys'
+import { comboFromEvent, comboProblem, displayCombo } from '../lib/hotkeys'
 import { osLabel } from '../lib/format'
 import { pushNotice } from '../lib/store'
 import type { AppSettings, DeliveryMode, Theme } from '../lib/types'
@@ -10,6 +10,7 @@ import type { AppSettings, DeliveryMode, Theme } from '../lib/types'
 const { state, settings, resync } = useAppStore()
 const isMac = computed(() => state.platform === 'macos')
 const recording = ref(false)
+const recorder = ref<HTMLElement | null>(null)
 const message = ref('')
 const addressInputs = ref<Record<string, string>>({})
 let clearTimer: ReturnType<typeof setTimeout> | undefined
@@ -25,7 +26,21 @@ function say(text: string) {
   clearTimer = setTimeout(() => (message.value = ''), 3000)
 }
 
-onBeforeUnmount(() => clearTimeout(clearTimer))
+function stopRecording() {
+  recording.value = false
+}
+
+onMounted(() => window.addEventListener('blur', stopRecording))
+onBeforeUnmount(() => {
+  clearTimeout(clearTimer)
+  window.removeEventListener('blur', stopRecording)
+})
+
+async function startRecording() {
+  recording.value = true
+  await nextTick()
+  recorder.value?.focus()
+}
 
 async function save(patch: Partial<AppSettings>) {
   if (!settings.value) return
@@ -46,10 +61,14 @@ function record(e: KeyboardEvent) {
     return
   }
   const combo = comboFromEvent(e)
-  if (combo) {
-    recording.value = false
-    void save({ hotkey: combo })
+  if (!combo) return
+  const problem = comboProblem(combo)
+  if (problem) {
+    say(problem)
+    return
   }
+  recording.value = false
+  void save({ hotkey: combo })
 }
 
 function toggleAutostart(e: Event) {
@@ -106,7 +125,7 @@ const themes: { id: Theme; name: string }[] = [
 </script>
 
 <template>
-  <main class="flex h-screen flex-col gap-6 overflow-y-auto p-6 text-[13px]" tabindex="-1" @keydown="record">
+  <main class="flex h-screen flex-col gap-6 overflow-y-auto p-6 text-[13px]" tabindex="-1">
     <header class="flex items-baseline justify-between">
       <h1 class="accent-text text-xl font-semibold tracking-tight">Settings</h1>
       <span class="text-[12px] text-[var(--muted)]" role="status">{{ message }}</span>
@@ -148,8 +167,8 @@ const themes: { id: Theme; name: string }[] = [
     <section v-if="settings" class="flex flex-col gap-3">
       <h2 class="text-[11px] font-medium uppercase tracking-wider text-[var(--muted)]">Catch shortcut</h2>
       <div class="flex items-center gap-3">
-        <kbd class="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 font-mono">{{ recording ? 'Press keys, Esc to cancel' : displayCombo(settings.hotkey, isMac) }}</kbd>
-        <button class="hoverable rounded-lg border border-[var(--border)] px-3 py-1.5 hover:bg-[var(--surface-strong)]" @click="recording = true">Change</button>
+        <kbd ref="recorder" tabindex="-1" class="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 font-mono outline-none" :class="recording ? 'border-[var(--accent-a)]' : ''" @keydown="record" @blur="stopRecording">{{ recording ? 'Press keys, Esc to cancel' : displayCombo(settings.hotkey, isMac) }}</kbd>
+        <button class="hoverable rounded-lg border border-[var(--border)] px-3 py-1.5 hover:bg-[var(--surface-strong)]" @click="startRecording">Change</button>
       </div>
 
       <h2 class="mt-2 text-[11px] font-medium uppercase tracking-wider text-[var(--muted)]">General</h2>

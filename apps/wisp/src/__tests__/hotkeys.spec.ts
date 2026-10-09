@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { comboFromEvent, displayCombo } from '../lib/hotkeys'
+import { comboFromEvent, comboProblem, displayCombo } from '../lib/hotkeys'
 
 const ev = (code: string, mods: Partial<Record<'ctrlKey' | 'altKey' | 'shiftKey' | 'metaKey', boolean>> = {}) => ({
   code,
@@ -26,5 +26,15 @@ describe('hotkeys', () => {
     expect(displayCombo('Ctrl+Alt+V', true)).toBe('Ctrl+Option+V')
     expect(displayCombo('Super+Shift+V', true)).toBe('Cmd+Shift+V')
     expect(displayCombo('Ctrl+Alt+V', false)).toBe('Ctrl+Alt+V')
+  })
+  it('rejects shift-only and editing combos with a friendly message', () => {
+    expect(comboProblem('Shift+V')).toBe('Add Ctrl, Alt or Cmd, Shift alone is not enough. Pick another one.')
+    expect(comboProblem('Ctrl+V')).toBe('That shortcut is used for editing. Pick another one.')
+    expect(comboProblem('Super+C')).toBe('That shortcut is used for editing. Pick another one.')
+    expect(comboProblem('Ctrl+Z')).toBe('That shortcut is used for editing. Pick another one.')
+    expect(comboProblem('Ctrl+Alt+V')).toBeNull()
+    expect(comboProblem('Ctrl+Shift+V')).toBeNull()
+    expect(comboProblem('Ctrl+5')).toBeNull()
+    expect(comboProblem('Alt+F9')).toBeNull()
   })
 })

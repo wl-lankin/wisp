@@ -62,6 +62,7 @@ export interface Snapshot {
   peers: PeerStatus[]
   nearby: NearbyDevice[]
   inbox: Offer[]
+  hotkeyError?: string | null
 }
 
 export interface AppSettings {

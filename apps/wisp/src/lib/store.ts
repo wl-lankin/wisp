@@ -30,6 +30,7 @@ export interface State {
   transfers: Record<string, Transfer>
   notices: Notice[]
   identityWarnings: string[]
+  hotkeyErrorShown: string
   historyVersion: number
 }
 
@@ -49,6 +50,7 @@ export function initialState(): State {
     transfers: {},
     notices: [],
     identityWarnings: [],
+    hotkeyErrorShown: '',
     historyVersion: 0,
   }
 }
@@ -62,6 +64,9 @@ export function applySnapshot(s: State, snap: Snapshot): void {
   s.peers = snap.peers
   s.nearby = snap.nearby.filter((n) => !snap.peers.some((p) => p.peer.deviceId === n.device))
   s.inbox = snap.inbox
+  const problem = snap.hotkeyError ?? ''
+  if (problem && problem !== s.hotkeyErrorShown) notify(s, 'warning', problem)
+  s.hotkeyErrorShown = problem
 }
 
 export function pushNotice(s: State, kind: Notice['kind'], text: string): void {

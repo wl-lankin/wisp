@@ -22,3 +22,21 @@ export function displayCombo(combo: string, isMac: boolean): string {
     .map((part) => (part === 'Alt' ? 'Option' : part === 'Super' ? 'Cmd' : part))
     .join('+')
 }
+
+const EDITING_KEYS = new Set(['C', 'V', 'X', 'A', 'Z'])
+
+/** Returns a friendly reason when a combo should not become a global shortcut. */
+export function comboProblem(combo: string): string | null {
+  const parts = combo.split('+')
+  const key = parts[parts.length - 1]
+  const mods = parts.slice(0, -1)
+  if (mods.length === 1 && mods[0] === 'Shift') return 'Add Ctrl, Alt or Cmd, Shift alone is not enough. Pick another one.'
+  if (mods.length === 1 && (mods[0] === 'Ctrl' || mods[0] === 'Super') && EDITING_KEYS.has(key)) {
+    return 'That shortcut is used for editing. Pick another one.'
+  }
+  return null
+}
+
+export function isAllowedCombo(combo: string): boolean {
+  return comboProblem(combo) === null
+}
